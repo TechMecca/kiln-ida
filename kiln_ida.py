@@ -19,6 +19,7 @@ Menu: Edit → Plugins → Kiln IDA (start/stop, status, autostart). Hotkey Ctrl
 Standard library only — nothing to pip-install into IDA's Python.
 """
 
+import collections
 import contextlib
 import ctypes
 import datetime
@@ -63,7 +64,7 @@ try:
 except ImportError:  # no decompiler in this installation
     ida_hexrays = None
 
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 PLUGIN_NAME = "Kiln IDA"
 DEFAULT_PORT = 24137
 PORT_RANGE = 100
@@ -1758,6 +1759,168 @@ def t_write_mem(args):
     return {"address": hexa(ea), "size": len(data), "now": back.hex(" ")}
 
 
+# ───────────────────────── debugger events (pushed by IDA, long-polled by Kiln) ─────────────────────────
+
+EVENTS_KEEP = 200
+_events: "collections.deque" = collections.deque(maxlen=EVENTS_KEEP)
+_events_cv = threading.Condition()
+_events_seq = 0
+
+
+def _stack_top(n: int = 8) -> list:
+    """The top n stack slots of the suspended thread: value and, when it points into a function, its name."""
+    try:
+        sp = int(ida_dbg.get_sp_val() or BADADDR)
+    except Exception:
+        return []
+    if sp == BADADDR:
+        return []
+    width = 8 if ida_ida.inf_is_64bit() else 4
+    data = ida_idd.dbg_read_memory(sp, width * n) or b""
+    out = []
+    for i in range(len(data) // width):
+        v = int.from_bytes(data[i * width:(i + 1) * width], "little")
+        row = {"offset": i * width, "value": hexa(v)}
+        pf = func_of(v)
+        if pf:
+            row["points_to"] = f"{ida_funcs.get_func_name(pf.start_ea)}+{v - pf.start_ea:#x}"
+        else:
+            nm = name_at(v)
+            if nm:
+                row["points_to"] = nm
+        out.append(row)
+    return out
+
+
+def _push_event(kind: str, ea: "int | None" = None, tid: "int | None" = None, extra: "dict | None" = None) -> None:
+    """Called from IDA's debugger hooks (main thread). Snapshots the stop and wakes anyone waiting."""
+    global _events_seq
+    ev = {"event": kind, "time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "source": _executor.busy_with if _executor else None}
+    if tid is not None:
+        ev["thread"] = tid
+    try:
+        if kind not in ("process_exited",) and ida_dbg.is_debugger_on():
+            ip = int(ida_dbg.get_ip_val() or BADADDR) if ea is None else int(ea)
+            if ip != BADADDR:
+                ev["ip"] = hexa(ip)
+                ev["instruction"] = (ida_lines.generate_disasm_line(ip, ida_lines.GENDSM_REMOVE_TAGS) or "").strip()
+                pf = func_of(ip)
+                if pf:
+                    ev["function"] = {**func_summary(pf), "offset": ip - pf.start_ea}
+                nm = name_at(ip)
+                if nm:
+                    ev["name"] = nm
+            if ida_dbg.get_process_state() == ida_dbg.DSTATE_SUSP:
+                regs = {}
+                for r in _reg_names():
+                    try:
+                        v = ida_dbg.get_reg_val(r)
+                        regs[r] = hexa(int(v)) if isinstance(v, int) else v
+                    except Exception:
+                        continue
+                ev["registers"] = regs
+                ev["stack"] = _stack_top()
+            if kind == "breakpoint" and ea is not None:
+                b = ida_dbg.bpt_t()
+                if ida_dbg.get_bpt(int(ea), b):
+                    ev["breakpoint"] = _bpt_row(b)
+    except Exception as e:  # never let a snapshot problem break the debugger
+        ev["snapshot_error"] = f"{type(e).__name__}: {e}"
+    if extra:
+        ev.update(extra)
+    with _events_cv:
+        _events_seq += 1
+        ev["seq"] = _events_seq
+        _events.append(ev)
+        _events_cv.notify_all()
+    log(f"debugger event #{ev['seq']}: {kind}{' at ' + ev['ip'] if ev.get('ip') else ''}{' (during ' + ev['source'] + ')' if ev.get('source') else ''}")
+
+
+class _DbgHooks(ida_dbg.DBG_Hooks):
+    """IDA's debugger notifications → the event queue. Installed while the server is on."""
+
+    def dbg_process_start(self, *a):
+        _push_event("process_started", ea=a[2] if len(a) > 2 else None, tid=a[1] if len(a) > 1 else None, extra={"pid": a[0] if a else None, "module": a[3] if len(a) > 3 else ""})
+        return 0
+
+    def dbg_process_attach(self, *a):
+        _push_event("process_attached", ea=a[2] if len(a) > 2 else None, tid=a[1] if len(a) > 1 else None, extra={"pid": a[0] if a else None})
+        return 0
+
+    def dbg_process_exit(self, *a):
+        _push_event("process_exited", extra={"pid": a[0] if a else None, "exit_code": a[3] if len(a) > 3 else None})
+        return 0
+
+    def dbg_process_detach(self, *a):
+        _push_event("process_detached", extra={"pid": a[0] if a else None})
+        return 0
+
+    def dbg_bpt(self, tid, ea, *rest):
+        _push_event("breakpoint", ea=ea, tid=tid)
+        return 0
+
+    def dbg_exception(self, *a):
+        # (pid, tid, ea, exc_code, exc_can_cont, exc_ea, exc_info)
+        _push_event("exception", ea=a[2] if len(a) > 2 else None, tid=a[1] if len(a) > 1 else None,
+                    extra={"code": hexa(int(a[3])) if len(a) > 3 and isinstance(a[3], int) else (a[3] if len(a) > 3 else None), "can_continue": bool(a[4]) if len(a) > 4 else None,
+                           "exception_address": hexa(int(a[5])) if len(a) > 5 and isinstance(a[5], int) else None, "info": a[6] if len(a) > 6 else ""})
+        return 0
+
+    def dbg_suspend_process(self, *a):
+        _push_event("suspended")
+        return 0
+
+    def dbg_step_into(self, *a):
+        _push_event("step")
+        return 0
+
+    def dbg_step_over(self, *a):
+        _push_event("step")
+        return 0
+
+    def dbg_step_until_ret(self, *a):
+        _push_event("step")
+        return 0
+
+
+def _hook_debugger() -> None:
+    if _state.dbg_hooks is None:
+        try:
+            _state.dbg_hooks = _DbgHooks()
+            _state.dbg_hooks.hook()
+        except Exception as e:
+            _state.dbg_hooks = None
+            log(f"debugger hooks not installed: {e}")
+
+
+def _unhook_debugger() -> None:
+    if _state.dbg_hooks is not None:
+        try:
+            _state.dbg_hooks.unhook()
+        except Exception:
+            pass
+        _state.dbg_hooks = None
+
+
+@tool("wait_for_debugger_event", "Wait for the debugged process to stop (a breakpoint, an exception, a pause, a step, the process starting or exiting) and return the events after `since` — each with the instruction, function, registers, top of the stack and the breakpoint that fired. Returns at once when there already are newer events, or after timeout_s with an empty list. Does not touch IDA's main thread while waiting. `source` names the Kiln tool that was running when the event happened (its result already reported it); events without a source came from the user or from a running process.", {"since": {"type": "integer", "description": "The last seq you have seen (0 = from the beginning of this session; the response's `seq` is the newest)."}, "timeout_s": {"type": "integer", "description": "How long to wait for a new event (default 25, max 60)."}}, chunked=True)
+def t_wait_dbg_event(args):
+    since = int_arg(args, "since", 0, 0, 1 << 31)
+    timeout = int_arg(args, "timeout_s", 25, 0, 60)
+    deadline = time.monotonic() + timeout
+    with _events_cv:
+        while True:
+            fresh = [e for e in _events if e["seq"] > since]
+            if fresh:
+                break
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            _events_cv.wait(min(left, 5))
+        newest = _events_seq
+        oldest = _events[0]["seq"] if _events else 0
+    return {"since": since, "seq": newest, "events": fresh, **({"dropped": True} if since and oldest > since + 1 else {})}
+
+
 # ───────────────────────── MCP (JSON-RPC 2.0 over HTTP) ─────────────────────────
 
 class _State:
@@ -1773,6 +1936,7 @@ class _State:
     errors = 0
     server: "ThreadingHTTPServer | None" = None
     thread: "threading.Thread | None" = None
+    dbg_hooks = None
 
 
 _state = _State()
@@ -1875,7 +2039,7 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/health":
             if not self._authorized():
                 return
-            self._json(200, {"ok": True, "session": _state.session_id, "binary": _state.binary, "pid": os.getpid(), "calls": _state.calls, "busy": _executor.busy_with if _executor else None})
+            self._json(200, {"ok": True, "session": _state.session_id, "binary": _state.binary, "pid": os.getpid(), "calls": _state.calls, "busy": _executor.busy_with if _executor else None, "events_seq": _events_seq})
         elif path == "/mcp":
             self._json(405, {"error": "no server-to-client stream; POST JSON-RPC to /mcp"}, {"Allow": "POST, DELETE"})
         else:
@@ -1983,6 +2147,7 @@ def start_server(base_port: int) -> str:
         _state.token = secrets.token_urlsafe(24)
         _state.started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _state.calls = _state.errors = 0
+        _hook_debugger()
         t = threading.Thread(target=srv.serve_forever, name="kiln-ida-mcp", daemon=True)
         _state.thread = t
         t.start()
@@ -1993,6 +2158,7 @@ def start_server(base_port: int) -> str:
 
 
 def stop_server(reason: str = "stopped") -> None:
+    _unhook_debugger()
     srv = _state.server
     if not srv:
         return

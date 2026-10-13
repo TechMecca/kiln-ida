@@ -7,7 +7,8 @@ sessions to a chat and the model works on the real database: functions, pseudoco
 cross-references, callers and callees, imports, exports, strings, segments, names, types, data,
 stack frames, memory, bookmarks, the debugger, navigation — and, with your permission per call,
 renames, comments, types, local variables, calling conventions, new functions, patches, breakpoints,
-running / stepping the program, and IDAPython.
+running / stepping the program, and IDAPython. It can also **push debugger events** so a client watches a
+session and reviews each stop (Kiln's `/ida` → *review stops*).
 
 Any MCP client that speaks Streamable HTTP can use it; the session file (below) has the URL and key.
 
@@ -30,7 +31,7 @@ Any MCP client that speaks Streamable HTTP can use it; the session file (below) 
    the Output window shows:
 
    ```
-   [Kiln IDA] server ON — session 50a47088 at http://127.0.0.1:24137/mcp (59 tools, Hex-Rays yes)
+   [Kiln IDA] server ON — session 50a47088 at http://127.0.0.1:24137/mcp (60 tools, Hex-Rays yes)
    ```
 
 3. In Kiln, type `/ida` in any chat, tick the session, Done. The chip above the composer shows
@@ -58,13 +59,13 @@ While the server is on, the plugin keeps `%APPDATA%\Kiln\ida\sessions\<id>.json`
 
 ```json
 {
-  "id": "50a47088", "plugin": "kiln-ida", "version": "0.2.0",
+  "id": "50a47088", "plugin": "kiln-ida", "version": "0.3.0",
   "name": "whoami.exe", "binary": "whoami.exe",
   "input_path": "C:\\dumps\\whoami.exe", "idb_path": "C:\\dumps\\whoami.exe.i64",
   "pid": 10216, "host": "127.0.0.1", "port": 24137, "url": "http://127.0.0.1:24137/mcp",
   "token": "…secret…", "ida_version": "9.1", "sdk": 910, "python": "3.10.5",
   "hexrays": true, "processor": "metapc", "bits": 64, "gui": true,
-  "started_at": "2026-10-13T10:00:00Z", "tools": 59
+  "started_at": "2026-10-13T10:00:00Z", "tools": 60
 }
 ```
 
@@ -93,7 +94,7 @@ MCP **Streamable HTTP**, JSON-RPC 2.0 over `POST /mcp`:
 | `ping`, `tools/list`, `tools/call` | As specified. `resources/list` and `prompts/list` return empty lists. |
 | notifications | `202 Accepted`, no body. Batches (JSON arrays) are accepted. |
 | `GET /mcp` | `405` (no SSE stream). `DELETE /mcp` → `204`. |
-| `GET /health` | `{ ok, session, binary, pid, calls, busy }` — needs the key. |
+| `GET /health` | `{ ok, session, binary, pid, calls, busy, events_seq }` — needs the key. |
 
 Tool results are `content: [{ type: "text", text: <JSON> }]` (and the same object as
 `structuredContent`); failures are `isError: true` with a one-line message (`No function at
@@ -118,9 +119,24 @@ favourite) is dropped, the call still runs, and the result lists it under `ignor
   list for 5 minutes (`refresh=true` rebuilds it).
 - Addresses accept an int, hex (`0x401000` / `401000h`), or a name (mangled or demangled).
 
+## Watching the debugger
+
+While the server is on the plugin hooks IDA's debugger. Every stop — a breakpoint, an exception, a pause,
+a step, the process starting or exiting — is snapshotted (instruction, function, registers, top of the
+stack, the breakpoint that fired) and queued with a sequence number. `wait_for_debugger_event` is a
+**long-poll**: give it the last `seq` you saw and it returns as soon as there is a newer event, or after
+`timeout_s` with an empty list. It runs off IDA's main thread, so stepping and reading still work while a
+client waits.
+
+Each event carries a `source`: the Kiln tool that was running when it happened (`debugger_start`,
+`debugger_step`, …), or `null` when nothing was — i.e. the user drove IDA, or a running process stopped on
+its own. A client watches by looping `wait_for_debugger_event` and reviewing the `null`-source stops (the
+tool-driven ones are already in that tool's own result). In Kiln this is `/ida` → **review stops**: the chat
+posts each stop and the model looks at what is going on, then drives on with `debugger_step`.
+
 ## Tools
 
-59 tools. Read-only ones Kiln runs without asking (except in Manual mode); modifying ones ask before
+60 tools. Read-only ones Kiln runs without asking (except in Manual mode); modifying ones ask before
 each call (except in Bypass mode) and Plan mode never offers them; ⚠ = `destructiveHint`, which the
 approval card says.
 
@@ -159,6 +175,7 @@ approval card says.
 | `list_breakpoints` | — | address, enabled, type, size, condition, pass count |
 | `get_cursor` | — | the address under the user's cursor and its function |
 | `get_debugger_state` | — | debugging?, state, threads, registers; when suspended: `ip`, the instruction, the function |
+| `wait_for_debugger_event` | `since?`, `timeout_s?` | long-poll: the debugger stops after `since` (instruction, registers, stack, breakpoint, `source`) |
 | `jump_to` | `address` | moves IDA's view (changes nothing) |
 
 ### Changing the database (modifying)
@@ -211,12 +228,12 @@ set PYTHONIOENCODING=utf-8
 python tests/live_test.py
 ```
 
-It reads the newest session file and runs 78 checks: security (401 / 403 / 405), `/health`,
+It reads the newest session file and runs 80 checks: security (401 / 403 / 405), `/health`,
 `initialize`, notifications → 202, `tools/list`, every read-only tool, each modifying tool followed
 by its undo, the searches with limits and budgets, unknown-argument handling, bookmarks, breakpoints,
-a real debugger run (start at the target, step, set a register, write memory back, continue, stop —
-set `KILN_LIVE_DEBUGGER=0` to skip it) and 6 concurrent calls. Last run against IDA 9.1 + Hex-Rays
-on `whoami.exe`: **78 passed, 0 failed**.
+a real debugger run (start at the target, read the pushed debugger events, step, set a register, write
+memory back, continue, stop — set `KILN_LIVE_DEBUGGER=0` to skip it) and 6 concurrent calls. Last run
+against IDA 9.1 + Hex-Rays on `whoami.exe`: **80 passed, 0 failed**.
 
 ## Troubleshooting
 
