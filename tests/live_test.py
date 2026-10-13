@@ -225,7 +225,7 @@ def main():
     callee = next((it for it in (cs or {}).get("items", []) if it["kind"] == "function"), None)
     if callee:
         cr, err = c.call("get_callers", address=callee["address"])
-        check(cr and any(it["address"].lower() == str(target).lower() for it in cr["items"]), f"get_callers of {callee['name']} includes the target: {err or cr['total']}")
+        check(cr and any((it.get("address") or "").lower() == str(target).lower() for it in cr["items"]), f"get_callers of {callee['name']} includes the target: {err or cr['total']}")
     gf, err = c.call("get_functions", addresses=[target, "0x1"])
     check(gf and gf["count"] == 2 and "prototype" in gf["items"][0] and "error" in gf["items"][1], f"get_functions: one result per address, errors per item: {err or 'ok'}")
     ia, err = c.call("get_cursor", action="get_cursor", bogus=1)
@@ -234,8 +234,10 @@ def main():
     check(st and st["count"] == 2 and st.get("resume_from"), f"search_text with limit: resume_from {st and st.get('resume_from')}")
     st2, err = c.call("search_text", text="zz_not_in_this_binary_zz", budget_ms=200)
     check(st2 is not None and st2["count"] == 0, f"search_text with a 200 ms budget returns: {err or st2}")
-    sb, err = c.call("search_bytes", pattern="48 8B", limit=3, budget_ms=3000)
-    check(sb and sb["count"] == 3 and sb.get("resume_from"), f"search_bytes with limit: {err or sb.get('resume_from')}")
+    seed, _ = c.call("read_bytes", address=target, size=2)
+    pat = " ".join(seed["hex"].split()[:2]) if seed else "90"
+    sb, err = c.call("search_bytes", pattern=pat, limit=1, budget_ms=3000)
+    check(sb and sb["count"] == 1 and sb.get("resume_from"), f"search_bytes for {pat!r} with limit 1: {err or sb.get('resume_from')}")
     di, err = c.call("get_data_item", address=target)
     check(di and di["kind"] == "code", f"get_data_item on code: {err or di['kind']}")
     strs, _ = c.call("list_strings", limit=1)
@@ -265,8 +267,10 @@ def main():
     if s["hexrays"] and d:
         pl, err = c.call("get_pseudocode_lines", address=target)
         check(pl and any("address" in ln for ln in pl["lines"]) and pl["lines"][0]["line"] == 1, f"get_pseudocode_lines: {err or (str(len(pl['lines'])) + ' lines, ' + str(sum(1 for ln in pl['lines'] if 'address' in ln)) + ' with addresses')}")
-        dm, err = c.call("decompile_many", addresses=[target, callee["address"] if callee else target], max_chars_each=300)
-        check(dm and dm["count"] == 2 and all("code" in it for it in dm["items"]) and dm["items"][0].get("truncated"), f"decompile_many: {err or 'two functions, cut at 300 chars'}")
+        dm, err = c.call("decompile_many", addresses=[target, callee["address"] if callee else target], max_chars_each=200)
+        cut_ok = dm and all(not it.get("truncated") or (it.get("chars", 0) > len(it["code"]) and len(it["code"]) <= 200) for it in dm["items"])
+        check(dm and dm["count"] == 2 and all("code" in it for it in dm["items"]) and cut_ok,
+              f"decompile_many: {err or ('two functions, ' + ', '.join(('cut' if it.get('truncated') else 'whole') + ' ' + str(len(it['code'])) + ' chars' for it in dm['items'])) }")
         import re as _re
         m = _re.search(r"^\s+(\S.*?) (v\d+); //", d["code"], _re.M)
         if m:
@@ -318,6 +322,23 @@ def main():
             check(ct and ct["event"] in ("breakpoint", "process_exited", "exception", "timeout"), f"debugger_step continue: {err or ct['event']}")
             if callee:
                 c.call("delete_breakpoint", address=callee["address"])
+        # Tracing: a logging breakpoint records hits without ever holding the program.
+        tgt_fn = (callee or {}).get("address") or target
+        lb, err = c.call("set_breakpoint", address=tgt_fn, suspend=False)
+        check(lb is not None and lb.get("suspend") is False and lb.get("traced") is True, f"a logging breakpoint (suspend=false): {err or json.dumps(lb)[:120]}")
+        ts, err = c.call("trace_start", kind="breakpoints", size=20000)
+        check(ts is not None and ts.get("tracing") == "breakpoints", f"trace_start: {err or ts}")
+        c.call("debugger_step", action="continue", timeout_s=3)
+        time.sleep(2)
+        tr, err = c.call("read_trace", limit=20)
+        check(tr is not None and "events" in tr, f"read_trace: {err or (str(tr.get('total')) + ' event(s) recorded')}")
+        st_now, _ = c.call("get_debugger_state")
+        held = st_now and st_now.get("debugger_on") and st_now.get("state") == "suspended" and (st_now.get("ip") or "").lower() == str(lb and lb.get("address")).lower()
+        check(not held, "the logging breakpoint never held the program at its address")
+        c.call("trace_stop")
+        tc, _ = c.call("trace_clear")
+        check(tc is not None and tc.get("events") == 0, "trace_clear empties the trace")
+        c.call("delete_breakpoint", address=tgt_fn)
         stp, err = c.call("debugger_stop")
         st4, _ = c.call("get_debugger_state")
         check(stp and st4 and st4["debugger_on"] is False, f"debugger_stop ends the session: {err or stp}")

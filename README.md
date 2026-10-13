@@ -31,7 +31,7 @@ Any MCP client that speaks Streamable HTTP can use it; the session file (below) 
    the Output window shows:
 
    ```
-   [Kiln IDA] server ON — session 50a47088 at http://127.0.0.1:24137/mcp (61 tools, Hex-Rays yes)
+   [Kiln IDA] server ON — session 50a47088 at http://127.0.0.1:24137/mcp (65 tools, Hex-Rays yes)
    ```
 
 3. In Kiln, type `/ida` in any chat, tick the session, Done. The chip above the composer shows
@@ -59,13 +59,13 @@ While the server is on, the plugin keeps `%APPDATA%\Kiln\ida\sessions\<id>.json`
 
 ```json
 {
-  "id": "50a47088", "plugin": "kiln-ida", "version": "0.4.0",
+  "id": "50a47088", "plugin": "kiln-ida", "version": "0.5.0",
   "name": "whoami.exe", "binary": "whoami.exe",
   "input_path": "C:\\dumps\\whoami.exe", "idb_path": "C:\\dumps\\whoami.exe.i64",
   "pid": 10216, "host": "127.0.0.1", "port": 24137, "url": "http://127.0.0.1:24137/mcp",
   "token": "…secret…", "ida_version": "9.1", "sdk": 910, "python": "3.10.5",
   "hexrays": true, "processor": "metapc", "bits": 64, "gui": true,
-  "started_at": "2026-10-13T10:00:00Z", "tools": 61
+  "started_at": "2026-10-13T10:00:00Z", "tools": 65
 }
 ```
 
@@ -130,6 +130,21 @@ A breakpoint stops the whole process when it is hit — every thread. To watch a
 target, give the breakpoint an IDC `condition` that does its logging and then evaluates false: IDA resumes on its
 own. Note that such a breakpoint produces no stop, so nothing appears in the live card or the review.
 
+## Tracing: getting information without stopping
+
+A breakpoint stops the program. To watch something busy without freezing it, make the breakpoint **non-suspending**
+with `set_breakpoint(..., suspend=false)`: IDA records each hit in the trace and lets the program run straight on.
+Call `trace_start` first, then read the hits back whenever you like with `read_trace`. This is the way to watch a hot
+function on an interactive target — the client never pauses, so it cannot time out or disconnect while you think.
+
+`trace_start` also offers two heavier modes. `function` records every call and return, so a short burst tells you
+what a function actually does at runtime; `instruction` records every instruction. Both work by single-stepping the
+process, which is hundreds of times slower — fine for a few seconds of a specific path, hopeless as a background
+setting. Measured on a small console program, a two second burst of function tracing recorded about 2,500 events
+with callee names resolved.
+
+`read_trace` returns the newest events by default and is paged, so a long recording can be read in chunks.
+
 ## Watching the debugger
 
 While the server is on the plugin hooks IDA's debugger. Every stop — a breakpoint, an exception, a pause,
@@ -153,7 +168,7 @@ posts each stop and the model looks at what is going on, then drives on with `de
 
 ## Tools
 
-61 tools. Read-only ones Kiln runs without asking (except in Manual mode); modifying ones ask before
+65 tools. Read-only ones Kiln runs without asking (except in Manual mode); modifying ones ask before
 each call (except in Bypass mode) and Plan mode never offers them; ⚠ = `destructiveHint`, which the
 approval card says.
 
@@ -227,8 +242,12 @@ confirmation the first time a process is started; the call waits for it.
 
 | Tool | Arguments | Effect |
 |---|---|---|
-| `set_breakpoint` | `address`, `kind?` (exec / write / read / access), `size?`, `condition?`, `enabled?` | add or update a **hardware** breakpoint — debug registers, no byte of the program is changed, so self-checks see nothing. Software (`0xCC`) breakpoints are deliberately not offered. Only 4 debug registers exist. A condition that evaluates false logs without stopping the process |
+| `set_breakpoint` | `address`, `kind?` (exec / write / read / access), `size?`, `suspend?`, `condition?`, `enabled?` | add or update a **hardware** breakpoint — debug registers, no byte of the program is changed, so self-checks see nothing. Software (`0xCC`) breakpoints are deliberately not offered. Only 4 debug registers exist. A condition that evaluates false logs without stopping the process |
 | `delete_breakpoint` | `address` | remove it |
+| `trace_start` | `kind?`, `size?`, `clear?` | start recording: `breakpoints` (logging breakpoints only, full speed), `function` (every call and return) or `instruction` (every instruction) |
+| `trace_stop` | — | stop recording; what was recorded stays readable |
+| `trace_clear` | — | throw the recording away |
+| `read_trace` | `offset?`, `limit?`, `newest?`, `kind?` | the recorded events: index, kind (bpt / call / ret / insn), thread, function + offset, and what a call called |
 | `debugger_start` ⚠ | `path?`, `args?`, `directory?`, `break_at?`, `timeout_s?` | **runs the program** under IDA and waits until it is suspended (at `break_at`, a breakpoint, or the entry); returns the stop event, instruction, registers |
 | `debugger_attach` ⚠ | `pid`, `timeout_s?` | attach to a running process and suspend it |
 | `debugger_step` | `action` (step_over / step_into / step_out / continue / run_to), `address?`, `timeout_s?` | drive the process and wait for the next stop; `event: timeout` means it is still running |

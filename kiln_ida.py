@@ -65,7 +65,7 @@ try:
 except ImportError:  # no decompiler in this installation
     ida_hexrays = None
 
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.5.0"
 PLUGIN_NAME = "Kiln IDA"
 DEFAULT_PORT = 24137
 PORT_RANGE = 100
@@ -1699,7 +1699,10 @@ def t_dbg_stop(args):
 
 def _bpt_row(b) -> dict:
     kinds = {ida_idd.BPT_SOFT: "software", ida_idd.BPT_EXEC: "hardware exec", ida_idd.BPT_WRITE: "hardware write", ida_idd.BPT_READ: "hardware read", ida_idd.BPT_RDWR: "hardware read/write"}
-    return {"address": hexa(b.ea), "enabled": b.enabled(), "type": kinds.get(b.type, str(b.type)), "size": b.size, "condition": b.condition or "", "pass_count": b.pass_count, "name": name_at(b.ea)}
+    suspend = bool(b.flags & ida_dbg.BPT_BRK)
+    return {"address": hexa(b.ea), "enabled": b.enabled(), "type": kinds.get(b.type, str(b.type)), "size": b.size,
+            "condition": b.condition or "", "pass_count": b.pass_count, "name": name_at(b.ea),
+            "suspend": suspend, "traced": bool(b.flags & ida_dbg.BPT_TRACE) or not suspend}
 
 
 @tool("list_breakpoints", "The debugger's breakpoints: address, enabled, type, size, condition, pass count.")
@@ -1712,7 +1715,7 @@ def t_list_bpts(args):
     return {"count": len(out), "breakpoints": out}
 
 
-@tool("set_breakpoint", "Add (or update) a HARDWARE breakpoint — the CPU's debug registers, so not one byte of the program changes and code that checksums itself sees nothing. kind=exec (default) breaks when the address is executed; kind=write|read|access watches DATA at the address (give size). There are only 4 debug registers, so delete breakpoints you no longer need. An IDC condition that evaluates to false lets the process carry straight on (log without freezing it). Software (0xCC) breakpoints are deliberately not available: they patch the code and any self-check can see them.", {"address": ADDR, "kind": {"type": "string", "enum": ["exec", "write", "read", "access"], "description": "Default exec (break when it runs)."}, "size": {"type": "integer", "description": "Bytes watched by a data breakpoint (1, 2, 4, 8)."}, "condition": {"type": "string"}, "enabled": {"type": "boolean"}}, ["address"], write=True)
+@tool("set_breakpoint", "Add (or update) a HARDWARE breakpoint — the CPU's debug registers, so not one byte of the program changes and code that checksums itself sees nothing. kind=exec (default) breaks when the address is executed; kind=write|read|access watches DATA at the address (give size). There are only 4 debug registers, so delete breakpoints you no longer need. **suspend=false makes it a logging breakpoint**: every hit is recorded in the trace and the program carries straight on, so you can watch a hot function without freezing the target — read the hits back with read_trace (call trace_start first). Software (0xCC) breakpoints are deliberately not available: they patch the code and any self-check can see them.", {"address": ADDR, "kind": {"type": "string", "enum": ["exec", "write", "read", "access"], "description": "Default exec (break when it runs)."}, "size": {"type": "integer", "description": "Bytes watched by a data breakpoint (1, 2, 4, 8)."}, "suspend": {"type": "boolean", "description": "Default true: stop the program on a hit. false: record the hit and keep running."}, "condition": {"type": "string"}, "enabled": {"type": "boolean"}}, ["address"], write=True)
 def t_set_bpt(args):
     ea = parse_ea(args.get("address"))
     # Hardware only: a software breakpoint writes 0xCC into the code, which a self-checking target can detect.
@@ -1730,6 +1733,14 @@ def t_set_bpt(args):
     changed = False
     if "condition" in args:
         b.condition = str(args.get("condition") or "")
+        changed = True
+    if "suspend" in args:
+        # BPT_BRK is what stops the program; without it IDA records the hit (BPT_TRACE) and resumes by itself.
+        if args.get("suspend"):
+            b.flags |= ida_dbg.BPT_BRK
+        else:
+            b.flags &= ~ida_dbg.BPT_BRK
+            b.flags |= ida_dbg.BPT_TRACE
         changed = True
     if changed and not ida_dbg.update_bpt(b):
         raise ToolError("Couldn't update the breakpoint.")
@@ -2080,6 +2091,122 @@ def t_wait_dbg_event(args):
         newest = _events_seq
         oldest = _events[0]["seq"] if _events else 0
     return {"since": since, "seq": newest, "events": fresh, **({"dropped": True} if since and oldest > since + 1 else {})}
+
+
+
+# ───────────────────────── tracing ─────────────────────────
+
+TEV_NAMES = None
+
+
+def _tev_name(t: int) -> str:
+    global TEV_NAMES
+    if TEV_NAMES is None:
+        TEV_NAMES = {}
+        for n in ("tev_none", "tev_insn", "tev_call", "tev_ret", "tev_bpt", "tev_mem"):
+            v = getattr(ida_dbg, n, None)
+            if isinstance(v, int):
+                TEV_NAMES[v] = n[4:]
+    return TEV_NAMES.get(t, str(t))
+
+
+def _where(ea: int) -> dict:
+    out = {"address": hexa(ea)}
+    pf = func_of(ea)
+    if pf:
+        out["function"] = ida_funcs.get_func_name(pf.start_ea) or hexa(pf.start_ea)
+        if ea != pf.start_ea:
+            out["offset"] = ea - pf.start_ea
+    else:
+        nm = name_at(ea)
+        if nm:
+            out["name"] = nm
+    return out
+
+
+@tool("trace_start", "Start recording a trace. kind=breakpoints (default) records only the hits of breakpoints you made non-suspending (set_breakpoint with suspend=false) — the program runs at full speed and you read the hits back with read_trace. kind=function records every call and return, kind=instruction records every instruction: both single-step the process, which is hundreds of times slower and will make an interactive program crawl. The buffer keeps the most recent `size` events.", {"kind": {"type": "string", "enum": ["breakpoints", "function", "instruction"], "description": "Default breakpoints."}, "size": {"type": "integer", "description": "How many events to keep (default 100000, 0 = unlimited)."}, "clear": {"type": "boolean", "description": "Throw away what is already recorded (default true)."}}, write=True)
+def t_trace_start(args):
+    if not ida_dbg.is_debugger_on():
+        raise ToolError("The debugger isn't running — start or attach to the program first.")
+    kind = str(args.get("kind") or "breakpoints")
+    if kind not in ("breakpoints", "function", "instruction"):
+        raise ToolError("kind must be breakpoints, function or instruction.")
+    size = int_arg(args, "size", 100000, 0, 10_000_000)
+    ida_dbg.set_trace_size(size)
+    if args.get("clear", True):
+        ida_dbg.clear_trace()
+    ida_dbg.enable_insn_trace(kind == "instruction")
+    ida_dbg.enable_func_trace(kind == "function")
+    if kind == "breakpoints":
+        ida_dbg.enable_step_trace(False)
+    else:
+        ida_dbg.enable_step_trace(True)
+    return {"tracing": kind, "size": size, "events": ida_dbg.get_tev_qty(),
+            "note": "non-suspending breakpoints are recorded in every mode; function and instruction tracing single-step the process and are very slow"}
+
+
+@tool("trace_stop", "Stop recording. What was recorded stays readable with read_trace until trace_clear.", write=True)
+def t_trace_stop(args):
+    ida_dbg.enable_insn_trace(False)
+    ida_dbg.enable_func_trace(False)
+    ida_dbg.enable_step_trace(False)
+    return {"tracing": False, "events": ida_dbg.get_tev_qty()}
+
+
+@tool("trace_clear", "Throw away everything recorded so far.", write=True)
+def t_trace_clear(args):
+    ida_dbg.clear_trace()
+    return {"events": ida_dbg.get_tev_qty()}
+
+
+@tool("read_trace", "The recorded trace events, newest last: each one's index, kind (bpt / call / ret / insn), thread, where it happened (function + offset) and, for a call, what it called. Paged — read the end with a large offset, or pass only `limit` to get the most recent ones.", {"offset": {"type": "integer", "description": "Skip this many from the start."}, "limit": {"type": "integer", "description": "At most this many (default 200, max 2000)."}, "newest": {"type": "boolean", "description": "true (default when no offset): return the most recent ones."}, "kind": {"type": "string", "enum": ["bpt", "call", "ret", "insn", "mem"], "description": "Only events of this kind."}}, chunked=True)
+def t_read_trace(args):
+    limit = int_arg(args, "limit", 200, 1, 2000)
+    want = str(args.get("kind") or "")
+    deadline = budget_deadline(args, 20000)
+
+    def total():
+        return ida_dbg.get_tev_qty()
+    n = on_main(total, label="read_trace")
+    if n == 0:
+        return {"total": 0, "events": [], "note": "nothing recorded — call trace_start, and make the breakpoints you want logged non-suspending (set_breakpoint suspend=false)"}
+    newest = args.get("newest", "offset" not in args)
+    start = int_arg(args, "offset", max(0, n - limit) if newest else 0, 0, max(0, n))
+    out, i, WINDOW = [], start, 400
+    while i < n and len(out) < limit:
+        hi = min(n, i + WINDOW)
+
+        def window():
+            rows = []
+            tev = ida_dbg.tev_info_t()
+            for k in range(i, hi):
+                if len(out) + len(rows) >= limit:
+                    break
+                if not ida_dbg.get_tev_info(k, tev):
+                    continue
+                kind = _tev_name(tev.type)
+                if want and kind != want:
+                    continue
+                row = {"index": k, "kind": kind, "thread": tev.tid, **_where(tev.ea)}
+                if kind == "call":
+                    callee = ida_dbg.get_call_tev_callee(k)
+                    if callee != BADADDR:
+                        row["calls"] = _where(callee)
+                elif kind == "ret":
+                    to = ida_dbg.get_ret_tev_return(k)
+                    if to != BADADDR:
+                        row["returns_to"] = _where(to)
+                elif kind == "bpt":
+                    at = ida_dbg.get_bpt_tev_ea(k)
+                    if at != BADADDR:
+                        row["breakpoint"] = hexa(at)
+                rows.append(row)
+            return rows
+        out.extend(on_main(window, label="read_trace"))
+        i = hi
+        if time.monotonic() > deadline:
+            break
+    return {"total": n, "offset": start, "count": len(out), "events": out, **({"next_offset": i} if i < n else {})}
 
 
 # ───────────────────────── MCP (JSON-RPC 2.0 over HTTP) ─────────────────────────
