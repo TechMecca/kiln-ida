@@ -28,6 +28,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import struct
 import sys
 import threading
@@ -64,7 +65,7 @@ try:
 except ImportError:  # no decompiler in this installation
     ida_hexrays = None
 
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.3.1"
 PLUGIN_NAME = "Kiln IDA"
 DEFAULT_PORT = 24137
 PORT_RANGE = 100
@@ -2005,6 +2006,18 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):  # quiet: our own log is enough
         pass
 
+    def handle_one_request(self):
+        """As the base class, but a client hanging up on an idle keep-alive connection ends it quietly.
+
+        Kiln (and any HTTP/1.1 client with a connection pool) keeps sockets open between calls and closes them when
+        idle. The base class lets the resulting ConnectionAbortedError / ConnectionResetError escape, and socketserver
+        prints a traceback for it — noise in IDA's Output window for something completely normal.
+        """
+        try:
+            return BaseHTTPRequestHandler.handle_one_request(self)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, socket.timeout):
+            self.close_connection = True
+
     def _send(self, code: int, body: bytes = b"", ctype: str = "application/json", extra: "dict | None" = None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -2077,6 +2090,13 @@ class _Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False  # a port in use must fail, not be shared
+
+    def handle_error(self, request, client_address):
+        """Never print a traceback to IDA's Output window: a dropped connection is normal, anything else goes to the log."""
+        e = sys.exc_info()[1]
+        if isinstance(e, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, socket.timeout)):
+            return
+        log(f"HTTP error from {client_address[0] if client_address else '?'}: {traceback.format_exc(limit=4)}")
 
 
 # ───────────────────────── session registration ─────────────────────────

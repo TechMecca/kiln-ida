@@ -59,7 +59,7 @@ While the server is on, the plugin keeps `%APPDATA%\Kiln\ida\sessions\<id>.json`
 
 ```json
 {
-  "id": "50a47088", "plugin": "kiln-ida", "version": "0.3.0",
+  "id": "50a47088", "plugin": "kiln-ida", "version": "0.3.1",
   "name": "whoami.exe", "binary": "whoami.exe",
   "input_path": "C:\\dumps\\whoami.exe", "idb_path": "C:\\dumps\\whoami.exe.i64",
   "pid": 10216, "host": "127.0.0.1", "port": 24137, "url": "http://127.0.0.1:24137/mcp",
@@ -247,6 +247,7 @@ against IDA 9.1 + Hex-Rays on `whoami.exe`: **80 passed, 0 failed**.
 | A call takes long and IDA's UI freezes | A single IDA call (one `decompile`, building `list_strings`) runs on IDA's main thread — the IDA API requires it. The searches, batch decompiles and similarity scans are chunked with a `budget_ms`, so the UI breathes between windows. |
 | `debugger_start` fails or hangs | Pick a debugger in IDA (Debugger → Select debugger) and check Debugger → Process options; the input file must exist. A confirmation dialog in IDA blocks the call until answered. |
 | `401` from a script | Send `Authorization: Bearer <token>` from the session file — every endpoint needs it. |
+| `ConnectionAbortedError` / `ConnectionResetError` traceback in the Output window | Fixed in **0.3.1**. An HTTP/1.1 client (Kiln included) keeps sockets open between calls and closes them when idle; older builds let Python print a traceback for that. It never affected a call — the one before it still says `ok`. Update the plugin and restart IDA. |
 | Headless `idat -S` | Cross-thread `execute_sync` is only serviced by the GUI event loop; the server needs the IDA GUI (`ida.exe`). |
 
 ## Limitations
