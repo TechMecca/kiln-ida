@@ -74,6 +74,10 @@ class Client:
             return text, None
 
 
+def hexa_norm(ea):
+    return f"0x{int(ea):X}"
+
+
 def main():
     s = newest_session(sys.argv[1] if len(sys.argv) > 1 else None)
     print(f"session {s['id']} · {s['name']} · {s['url']} · IDA {s['ida_version']} · Hex-Rays {s['hexrays']} · {s['tools']} tools")
@@ -213,6 +217,98 @@ def main():
                 c.call("rename_local_variable", function=target, old_name="kiln_tmp_var", new_name=m.group(1))
     w, _ = c.call("wait_for_analysis")
     check(w and w["analysis_done"], "wait_for_analysis")
+
+    # 0.2: calls graph, batches, decompiler extras, struct recovery, signatures, similarity, data, bookmarks, searches with
+    # a budget, unknown arguments, breakpoints and the debugger (the program is started and stopped under IDA).
+    cs, err = c.call("get_callees", address=target)
+    check(cs and cs["distinct_targets"] >= 1 and all(k in cs["items"][0] for k in ("name", "kind", "calls", "sites")), f"get_callees: {err or (str(cs['distinct_targets']) + ' targets, e.g. ' + cs['items'][0]['name'])}")
+    callee = next((it for it in (cs or {}).get("items", []) if it["kind"] == "function"), None)
+    if callee:
+        cr, err = c.call("get_callers", address=callee["address"])
+        check(cr and any(it["address"].lower() == str(target).lower() for it in cr["items"]), f"get_callers of {callee['name']} includes the target: {err or cr['total']}")
+    gf, err = c.call("get_functions", addresses=[target, "0x1"])
+    check(gf and gf["count"] == 2 and "prototype" in gf["items"][0] and "error" in gf["items"][1], f"get_functions: one result per address, errors per item: {err or 'ok'}")
+    ia, err = c.call("get_cursor", action="get_cursor", bogus=1)
+    check(ia is not None and ia.get("ignored_arguments") == ["action", "bogus"], f"unknown arguments are ignored and reported: {err or ia.get('ignored_arguments')}")
+    st, err = c.call("search_text", text="call", limit=2, budget_ms=3000)
+    check(st and st["count"] == 2 and st.get("resume_from"), f"search_text with limit: resume_from {st and st.get('resume_from')}")
+    st2, err = c.call("search_text", text="zz_not_in_this_binary_zz", budget_ms=200)
+    check(st2 is not None and st2["count"] == 0, f"search_text with a 200 ms budget returns: {err or st2}")
+    sb, err = c.call("search_bytes", pattern="48 8B", limit=3, budget_ms=3000)
+    check(sb and sb["count"] == 3 and sb.get("resume_from"), f"search_bytes with limit: {err or sb.get('resume_from')}")
+    di, err = c.call("get_data_item", address=target)
+    check(di and di["kind"] == "code", f"get_data_item on code: {err or di['kind']}")
+    strs, _ = c.call("list_strings", limit=1)
+    if strs and strs["items"]:
+        di2, err = c.call("get_data_item", address=strs["items"][0]["address"])
+        check(di2 and di2["kind"] == "string" and di2["text"], f"get_data_item on a string: {err or repr(di2['text'][:30])}")
+    ss, err = c.call("suggest_struct_from_accesses", address=target)
+    check((ss and ss["registers"] and "struct_c" in ss["registers"][0]) or (err and "No [register+offset]" in err), f"suggest_struct_from_accesses: {err or (ss['registers'][0]['register'] + ' ' + str(ss['registers'][0]['fields']) + ' fields')}")
+    ls, err = c.call("list_signatures")
+    check(ls is not None and "signatures" in ls, f"list_signatures: {err or ls['count']}")
+    sim, err = c.call("find_similar_functions", address=target, min_similarity=0.1, limit=3, budget_ms=10000)
+    check(sim is not None and "matches" in sim and sim["compared"] >= 0, f"find_similar_functions: {err or (str(sim['compared']) + ' compared, ' + str(len(sim['matches'])) + ' matches')}")
+    bm_before, _ = c.call("list_bookmarks")
+    ab, err = c.call("add_bookmark", address=target, description="kiln live test")
+    check(ab and ab["slot"] >= 1, f"add_bookmark: {err or ab}")
+    bl, _ = c.call("list_bookmarks")
+    check(bl and bl["count"] == bm_before["count"] + 1 and any(b["description"] == "kiln live test" for b in bl["bookmarks"]), "list_bookmarks shows it")
+    db, err = c.call("delete_bookmark", slot=ab["slot"]) if ab else (None, "no slot")
+    bl2, _ = c.call("list_bookmarks")
+    check(db and db["deleted"] and bl2["count"] == bm_before["count"], f"delete_bookmark: {err or 'ok'}")
+    mn, err = c.call("mark_as_noreturn", address=target, noreturn=True)
+    mn2, _ = c.call("mark_as_noreturn", address=target, noreturn=False)
+    check(mn and mn["noreturn"] is True and mn2 and mn2["noreturn"] is False, f"mark_as_noreturn on and off: {err or 'ok'}")
+    cc, err = c.call("set_calling_convention", address=target, convention="stdcall")
+    cc2, _ = c.call("set_calling_convention", address=target, convention="fastcall")
+    check(cc and "__stdcall" in cc["prototype"] and cc2 and "__fastcall" in cc2["prototype"], f"set_calling_convention stdcall then fastcall: {err or cc2 and cc2['prototype']}")
+    if s["hexrays"] and d:
+        pl, err = c.call("get_pseudocode_lines", address=target)
+        check(pl and any("address" in ln for ln in pl["lines"]) and pl["lines"][0]["line"] == 1, f"get_pseudocode_lines: {err or (str(len(pl['lines'])) + ' lines, ' + str(sum(1 for ln in pl['lines'] if 'address' in ln)) + ' with addresses')}")
+        dm, err = c.call("decompile_many", addresses=[target, callee["address"] if callee else target], max_chars_each=300)
+        check(dm and dm["count"] == 2 and all("code" in it for it in dm["items"]) and dm["items"][0].get("truncated"), f"decompile_many: {err or 'two functions, cut at 300 chars'}")
+        import re as _re
+        m = _re.search(r"^\s+(\S.*?) (v\d+); //", d["code"], _re.M)
+        if m:
+            old_type, var = m.group(1), m.group(2)
+            lt, err = c.call("set_lvar_type", function=target, name=var, type="char *")
+            lt2, _ = c.call("set_lvar_type", function=target, name=var, type=old_type)
+            check(lt and lt["type"] == "char *" and lt2, f"set_lvar_type {var}: char * then back to {old_type}: {err or 'ok'}")
+            lc, err = c.call("set_lvar_comment", function=target, name=var, comment="kiln")
+            lc2, _ = c.call("set_lvar_comment", function=target, name=var, comment="")
+            check(lc and lc["comment"] == "kiln" and lc2 and lc2["comment"] == "", f"set_lvar_comment set and cleared: {err or 'ok'}")
+    # Breakpoints and the debugger: the program runs under IDA (needs the input file next to the database).
+    bp, err = c.call("set_breakpoint", address=target, condition="1")
+    bl3, _ = c.call("list_breakpoints")
+    dbp, _ = c.call("delete_breakpoint", address=target)
+    check(bp and bp["condition"] == "1" and bl3 and bl3["count"] >= 1 and dbp and dbp["deleted"], f"set / list / delete breakpoint: {err or 'ok'}")
+    if os.environ.get("KILN_LIVE_DEBUGGER", "1") == "1" and os.path.exists(info.get("input_path") or ""):
+        ds, err = c.call("debugger_start", break_at=target, timeout_s=60)
+        check(ds and ds["state"] == "suspended" and ds.get("ip") and ds["event"] in ("breakpoint", "process_started", "step"), f"debugger_start stops at the target: {err or (ds['event'] + ' at ' + str(ds.get('ip')))}")
+        if ds and ds["state"] == "suspended":
+            ip0 = ds["ip"]
+            so, err = c.call("debugger_step", action="step_over", timeout_s=20)
+            check(so and so["state"] == "suspended" and so["ip"] != ip0, f"debugger_step step_over moved from {ip0} to {so and so.get('ip')}: {err or 'ok'}")
+            regs = so["registers"] if so else {}
+            reg = "rax" if "rax" in regs else ("eax" if "eax" in regs else None)
+            if reg:
+                sr, err = c.call("set_register", name=reg, value="0x1234")
+                st3, _ = c.call("get_debugger_state")
+                check(sr and st3 and st3["registers"][reg] == "0x1234", f"set_register {reg}: {err or st3 and st3['registers'][reg]}")
+            rb2, _ = c.call("read_bytes", address=ip0, size=4, debugger=True)
+            wm, err = c.call("write_memory", address=ip0, hex=rb2["hex"]) if rb2 else (None, "no read")
+            check(wm and wm["now"] == rb2["hex"], f"write_memory (same bytes back): {err or 'ok'}")
+            if callee:
+                c.call("set_breakpoint", address=callee["address"])
+            ct, err = c.call("debugger_step", action="continue", timeout_s=30)
+            check(ct and ct["event"] in ("breakpoint", "process_exited", "exception", "timeout"), f"debugger_step continue: {err or ct['event']}")
+            if callee:
+                c.call("delete_breakpoint", address=callee["address"])
+        stp, err = c.call("debugger_stop")
+        st4, _ = c.call("get_debugger_state")
+        check(stp and st4 and st4["debugger_on"] is False, f"debugger_stop ends the session: {err or stp}")
+    else:
+        print("  (debugger run skipped: KILN_LIVE_DEBUGGER=0 or the input file isn't there)")
 
     # Concurrency: several requests at once are served (serialized inside IDA).
     import threading

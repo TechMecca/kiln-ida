@@ -27,6 +27,7 @@ import json
 import os
 import re
 import secrets
+import struct
 import sys
 import threading
 import time
@@ -41,6 +42,7 @@ import ida_entry
 import ida_frame
 import ida_funcs
 import ida_ida
+import ida_idc
 import ida_idd
 import ida_idp
 import ida_kernwin
@@ -51,6 +53,7 @@ import ida_name
 import ida_search
 import ida_segment
 import ida_typeinf
+import ida_ua
 import ida_xref
 import idautils
 import idc
@@ -60,7 +63,7 @@ try:
 except ImportError:  # no decompiler in this installation
     ida_hexrays = None
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 PLUGIN_NAME = "Kiln IDA"
 DEFAULT_PORT = 24137
 PORT_RANGE = 100
@@ -291,6 +294,8 @@ def strings_list(min_length: int, refresh: bool) -> list:
         items = []
         for it in s:
             try:
+                if ida_bytes.is_code(ida_bytes.get_flags(ida_bytes.get_item_head(it.ea))):
+                    continue  # instruction bytes that happen to look like text (often starting mid-instruction)
                 items.append({"address": hexa(it.ea), "length": it.length, "type": "utf16" if it.strtype == ida_nalt.STRTYPE_C_16 else "c", "text": str(it)})
             except Exception:
                 continue
@@ -303,14 +308,16 @@ def strings_list(min_length: int, refresh: bool) -> list:
 TOOLS: "dict[str, dict]" = {}
 
 
-def tool(name: str, description: str, params: dict | None = None, required: list | None = None, *, write: bool = False, destructive: bool = False, title: str | None = None):
-    """Registers a tool. `write`: runs under MFF_WRITE and is marked as modifying the database."""
+def tool(name: str, description: str, params: dict | None = None, required: list | None = None, *, write: bool = False, destructive: bool = False, title: str | None = None, chunked: bool = False):
+    """Registers a tool. `write`: runs under MFF_WRITE and is marked as modifying the database. `chunked`: the function
+    runs on the server thread and sends its own windows of work to IDA's main thread (on_main) so the UI breathes
+    between them and a budget_ms can stop it."""
     def deco(fn):
         TOOLS[name] = {
-            "fn": fn, "write": write,
+            "fn": fn, "write": write, "chunked": chunked,
             "def": {
                 "name": name, "description": description,
-                "inputSchema": {"type": "object", "properties": params or {}, **({"required": required} if required else {})},
+                "inputSchema": {"type": "object", "properties": params or {}, **({"required": required} if required else {}), "additionalProperties": False},
                 "annotations": {"title": title or name.replace("_", " "), "readOnlyHint": not write, "destructiveHint": destructive, "idempotentHint": not write, "openWorldHint": False},
             },
         }
@@ -319,6 +326,16 @@ def tool(name: str, description: str, params: dict | None = None, required: list
 
 
 ADDR = {"type": "string", "description": "An address (hex, e.g. 0x401000) or a name (e.g. sub_401000, main)."}
+BUDGET = {"type": "integer", "description": "Time budget in milliseconds: stop after this long and return what was found so far, with resume_from (default 20000, max 180000)."}
+
+
+def budget_deadline(args: dict, default_ms: int = 20000, max_ms: int = 180000) -> float:
+    return time.monotonic() + int_arg(args, "budget_ms", default_ms, 100, max_ms) / 1000
+
+
+def on_main(fn, write: bool = False, label: str = ""):
+    """From a chunked tool (server thread): run one window of work on IDA's main thread."""
+    return _executor.run(fn, write, label)
 PAGING = {"offset": {"type": "integer", "description": "Skip this many (paging)."}, "limit": {"type": "integer", "description": "At most this many (default 100, max 1000)."}}
 
 
@@ -368,16 +385,7 @@ def t_function(args):
     pfn = func_of(ea)
     if not pfn:
         raise ToolError(f"{hexa(ea)} is not inside a function (create_function can make one).")
-    callers = sum(1 for x in idautils.XrefsTo(pfn.start_ea) if x.iscode)
-    chunks = [{"start": hexa(start), "end": hexa(end)} for start, end in idautils.Chunks(pfn.start_ea)]
-    f = pfn.flags
-    return {
-        **func_summary(pfn), "prototype": ida_typeinf.print_type(pfn.start_ea, ida_typeinf.PRTYPE_1LINE) or "",
-        "comment": ida_funcs.get_func_cmt(pfn, False) or "", "repeatable_comment": ida_funcs.get_func_cmt(pfn, True) or "",
-        "callers": callers, "chunks": chunks, "frame_size": ida_frame.get_frame_size(pfn),
-        "library": bool(f & ida_funcs.FUNC_LIB), "thunk": bool(f & ida_funcs.FUNC_THUNK), "noreturn": bool(f & ida_funcs.FUNC_NORET),
-        "decompilable": hexrays_ok(),
-    }
+    return _function_info(pfn)
 
 
 @tool("decompile", "Hex-Rays pseudocode of the function containing the address (needs the decompiler). Returns the C code with the function's name and bounds.", {"address": ADDR}, ["address"])
@@ -534,49 +542,109 @@ def t_read_bytes(args):
     return {"address": hexa(ea), "size": len(data), "hex": data.hex(" "), "ascii": "".join(chr(b) if 32 <= b < 127 else "." for b in data)}
 
 
-@tool("search_bytes", "Find a byte pattern (hex, ? for a wildcard byte, e.g. \"48 8B 05 ?? ?? ?? ??\"). Returns the addresses found and the function each is in.", {"pattern": {"type": "string"}, "start": ADDR, "end": ADDR, "limit": {"type": "integer", "description": "Default 100."}}, ["pattern"])
+@tool("search_bytes", "Find a byte pattern (hex, ? for a wildcard byte, e.g. \"48 8B 05 ?? ?? ?? ??\"). Returns the addresses found and the function each is in. Scans in windows so IDA stays responsive; stops at `limit` hits or when budget_ms runs out (then `resume_from` says where to continue).", {"pattern": {"type": "string"}, "start": ADDR, "end": ADDR, "limit": {"type": "integer", "description": "Default 100."}, "budget_ms": BUDGET}, ["pattern"], chunked=True)
 def t_search_bytes(args):
     pat = str(args.get("pattern") or "").strip()
     if not pat:
         raise ToolError("Give the pattern.")
-    start = parse_ea(args["start"]) if args.get("start") else ida_ida.inf_get_min_ea()
-    end = parse_ea(args["end"]) if args.get("end") else ida_ida.inf_get_max_ea()
     limit = int_arg(args, "limit", 100, 1, 1000)
-    vec = ida_bytes.compiled_binpat_vec_t()
-    # IDA 9: returns an error message, '' on success (older versions: a bool).
-    r = ida_bytes.parse_binpat_str(vec, start, pat, 16)
-    if (isinstance(r, str) and r) or r is False or len(vec) == 0:
-        raise ToolError(f"Couldn't parse the pattern “{pat}” — hex bytes separated by spaces, ? or ?? for any byte.{(' ' + r) if isinstance(r, str) and r else ''}")
+    deadline = budget_deadline(args)
+
+    def setup():
+        start = parse_ea(args["start"]) if args.get("start") else ida_ida.inf_get_min_ea()
+        end = parse_ea(args["end"]) if args.get("end") else ida_ida.inf_get_max_ea()
+        vec = ida_bytes.compiled_binpat_vec_t()
+        # IDA 9: returns an error message, '' on success (older versions: a bool).
+        r = ida_bytes.parse_binpat_str(vec, start, pat, 16)
+        if (isinstance(r, str) and r) or r is False or len(vec) == 0:
+            raise ToolError(f"Couldn't parse the pattern “{pat}” — hex bytes separated by spaces, ? or ?? for any byte.{(' ' + r) if isinstance(r, str) and r else ''}")
+        return start, end, vec, max(len(vec[0].bytes), 1)
+    ea, end, vec, patlen = on_main(setup, label="search_bytes")
     flags = getattr(ida_bytes, "BIN_SEARCH_FORWARD", 0) | getattr(ida_bytes, "BIN_SEARCH_NOBREAK", 0)
-    hits, ea = [], start
-    while len(hits) < limit and ea < end:
-        r = ida_bytes.bin_search(ea, end, vec, flags)
-        found = r[0] if isinstance(r, tuple) else r
-        if found is None or found == BADADDR:
+    hits, WINDOW, truncated = [], 4 * 1024 * 1024, False
+    while ea < end and len(hits) < limit:
+        wend = min(end, ea + WINDOW + patlen)
+
+        def window():
+            found, cur = [], ea
+            while cur < wend and len(hits) + len(found) < limit:
+                r = ida_bytes.bin_search(cur, wend, vec, flags)
+                at = r[0] if isinstance(r, tuple) else r
+                if at is None or at == BADADDR:
+                    break
+                pf = func_of(at)
+                found.append({"address": hexa(at), **({"function": ida_funcs.get_func_name(pf.start_ea), "function_address": hexa(pf.start_ea)} if pf else {})})
+                cur = at + 1
+            return found
+        hits.extend(on_main(window, label="search_bytes"))
+        ea = wend - patlen + 1 if wend < end else end
+        if time.monotonic() > deadline and ea < end:
+            truncated = True
             break
-        pf = func_of(found)
-        hits.append({"address": hexa(found), **({"function": ida_funcs.get_func_name(pf.start_ea), "function_address": hexa(pf.start_ea)} if pf else {})})
-        ea = found + 1
-    return {"pattern": pat, "count": len(hits), "hits": hits, **({"truncated": True} if len(hits) >= limit else {})}
+    out = {"pattern": pat, "count": len(hits), "hits": hits}
+    if len(hits) >= limit:
+        out.update(truncated=True, resume_from=hexa(int(hits[-1]["address"], 16) + 1))
+    elif truncated:
+        out.update(truncated=True, resume_from=hexa(ea), reason="budget_ms")
+    return out
 
 
-@tool("search_text", "Search the disassembly text (instructions, operands, names, comments) for a string. Returns matching lines with their addresses. Stops after `limit` hits or 20 seconds.", {"text": {"type": "string"}, "case_sensitive": {"type": "boolean"}, "start": ADDR, "limit": {"type": "integer", "description": "Default 50."}}, ["text"])
+@tool("search_text", "Search the disassembly text (instructions, operands, names, comments) for a string. Returns matching lines with their addresses. Scans in windows so IDA stays responsive; stops at `limit` hits or when budget_ms runs out (then `resume_from` says where to continue).", {"text": {"type": "string"}, "case_sensitive": {"type": "boolean"}, "start": ADDR, "end": ADDR, "limit": {"type": "integer", "description": "Default 50."}, "budget_ms": BUDGET}, ["text"], chunked=True)
 def t_search_text(args):
     text = str(args.get("text") or "")
     if not text:
         raise ToolError("Give the text.")
-    ea = parse_ea(args["start"]) if args.get("start") else ida_ida.inf_get_min_ea()
+    cs = bool(args.get("case_sensitive"))
+    needle = text if cs else text.lower()
     limit = int_arg(args, "limit", 50, 1, 500)
-    flags = ida_search.SEARCH_DOWN | (ida_search.SEARCH_CASE if args.get("case_sensitive") else 0)
-    hits, deadline, end = [], time.monotonic() + 20, ida_ida.inf_get_max_ea()
-    while len(hits) < limit and ea != BADADDR and ea < end and time.monotonic() < deadline:
-        ea = ida_search.find_text(ea, 0, 0, text, flags)
-        if ea == BADADDR:
+    deadline = budget_deadline(args)
+
+    def setup():
+        a = parse_ea(args["start"]) if args.get("start") else ida_ida.inf_get_min_ea()
+        b = parse_ea(args["end"]) if args.get("end") else ida_ida.inf_get_max_ea()
+        return a, b
+    ea, end = on_main(setup, label="search_text")
+    hits, WINDOW, truncated = [], 3000, False
+    while ea < end and ea != BADADDR and len(hits) < limit:
+        def window():
+            cur, n, found = ea, 0, []
+            while n < WINDOW and cur < end and cur != BADADDR and len(hits) + len(found) < limit:
+                flags = ida_bytes.get_flags(cur)
+                if ida_bytes.is_unknown(flags):
+                    # Skip the unexplored run in one go (every byte of it would be an item otherwise).
+                    try:
+                        nxt = ida_bytes.next_that(cur, end, lambda f, *_: not ida_bytes.is_unknown(f))
+                    except Exception:
+                        nxt = BADADDR
+                    cur = nxt if nxt != BADADDR and nxt > cur else ida_bytes.next_head(cur, end)
+                    n += 1
+                    continue
+                line = ida_lines.generate_disasm_line(cur, ida_lines.GENDSM_REMOVE_TAGS) or ""
+                hay = line if cs else line.lower()
+                if needle not in hay:
+                    for rep_ in (False, True):
+                        cmt = ida_bytes.get_cmt(cur, rep_) or ""
+                        if cmt and needle in (cmt if cs else cmt.lower()):
+                            line = line.rstrip() + "  ; " + cmt
+                            hay = needle
+                            break
+                if needle in hay:
+                    pf = func_of(cur)
+                    found.append({"address": hexa(cur), "text": line.strip(), **({"function": ida_funcs.get_func_name(pf.start_ea)} if pf else {})})
+                cur = ida_bytes.next_head(cur, end)
+                n += 1
+            return cur, found
+        ea, found = on_main(window, label="search_text")
+        hits.extend(found)
+        if time.monotonic() > deadline and ea < end and len(hits) < limit:
+            truncated = True
             break
-        pf = func_of(ea)
-        hits.append({"address": hexa(ea), "text": (ida_lines.generate_disasm_line(ea, ida_lines.GENDSM_REMOVE_TAGS) or "").strip(), **({"function": ida_funcs.get_func_name(pf.start_ea)} if pf else {})})
-        ea = ida_bytes.next_head(ea, end)
-    return {"text": text, "count": len(hits), "hits": hits, **({"truncated": True} if len(hits) >= limit or time.monotonic() >= deadline else {})}
+    out = {"text": text, "count": len(hits), "hits": hits}
+    if len(hits) >= limit and ea < end:
+        out.update(truncated=True, resume_from=hexa(ea))
+    elif truncated:
+        out.update(truncated=True, resume_from=hexa(ea), reason="budget_ms")
+    return out
 
 
 def _tif_kind(tif) -> str:
@@ -645,6 +713,16 @@ def t_cursor(args):
     return {"address": hexa(ea) if ea != BADADDR else None, "name": name_at(ea) if ea != BADADDR else "", **({"function": func_summary(pfn)} if pfn else {})}
 
 
+def _reg_names() -> list:
+    """Registers worth showing: the full-width ones on x86 / x64 (IDA's own list starts with ax, bx, …), else the processor's."""
+    proc = (ida_ida.inf_get_procname() or "").lower()
+    if proc == "metapc":
+        if ida_ida.inf_is_64bit():
+            return ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "efl", "cs", "ds", "es", "fs", "gs", "ss"]
+        return ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "efl", "cs", "ds", "es", "fs", "gs", "ss"]
+    return list(ida_idp.ph_get_regnames())[:64]
+
+
 @tool("get_debugger_state", "The debugger: whether a process is being debugged, its state, threads, and the current thread's registers.")
 def t_dbg(args):
     if not ida_dbg.is_debugger_on():
@@ -654,13 +732,25 @@ def t_dbg(args):
     threads = [{"id": ida_dbg.getn_thread(i), "name": ida_dbg.getn_thread_name(i) or ""} for i in range(ida_dbg.get_thread_qty())]
     regs = {}
     if st == ida_dbg.DSTATE_SUSP:
-        for r in list(ida_idp.ph_get_regnames())[:64]:
+        for r in _reg_names():
             try:
                 v = ida_dbg.get_reg_val(r)
                 regs[r] = hexa(int(v)) if isinstance(v, int) else v
             except Exception:
                 continue
-    return {"debugger_on": True, "state": state, "current_thread": ida_dbg.get_current_thread(), "threads": threads, "registers": regs}
+    out = {"debugger_on": True, "state": state, "current_thread": ida_dbg.get_current_thread(), "threads": threads, "registers": regs}
+    if st == ida_dbg.DSTATE_SUSP:
+        try:
+            ip = int(ida_dbg.get_ip_val() or BADADDR)
+            if ip != BADADDR:
+                out["ip"] = hexa(ip)
+                out["instruction"] = (ida_lines.generate_disasm_line(ip, ida_lines.GENDSM_REMOVE_TAGS) or "").strip()
+                pf = func_of(ip)
+                if pf:
+                    out["function"] = func_summary(pf)
+        except Exception:
+            pass
+    return out
 
 
 @tool("jump_to", "Move IDA's view to an address (shows it to the user). Changes nothing in the database.", {"address": ADDR}, ["address"])
@@ -820,6 +910,854 @@ def t_python(args):
     return out
 
 
+# ───────────────────────── calls graph, batches, decompiler extras ─────────────────────────
+
+CALL_TYPES = None  # set lazily: the xref types that are calls / jumps
+
+
+def _is_call_xref(x) -> bool:
+    global CALL_TYPES
+    if CALL_TYPES is None:
+        CALL_TYPES = {ida_xref.fl_CN, ida_xref.fl_CF, ida_xref.fl_JN, ida_xref.fl_JF}
+    return x.iscode and x.type in CALL_TYPES
+
+
+def _callee_kind(ea: int) -> str:
+    """What a call target is: a function here, an import (thunk / IAT slot), or plain data."""
+    pf = func_of(ea)
+    seg = ida_segment.getseg(ea)
+    segname = (ida_segment.get_segm_name(seg) or "") if seg else ""
+    if segname.lower() in (".idata", "idata", ".plt", ".got", "extern", "UNDEF") or (seg and seg.type == ida_segment.SEG_XTRN):
+        return "import"
+    if pf and (pf.flags & ida_funcs.FUNC_THUNK):
+        return "thunk"
+    if pf:
+        return "function"
+    n = name_at(ea)
+    return "import" if n.startswith("__imp_") else "data"
+
+
+def _call_sites_of(pfn) -> list:
+    """Every call / jump out of a function: (site, target)."""
+    out = []
+    for h in idautils.FuncItems(pfn.start_ea):
+        for x in idautils.XrefsFrom(h):
+            if _is_call_xref(x) and not (pfn.start_ea <= x.to < pfn.end_ea):
+                out.append((h, x.to))
+    return out
+
+
+def _group_calls(pairs, key_index: int, max_sites: int = 5) -> list:
+    groups: "dict[int, dict]" = {}
+    for site, other in pairs:
+        k = (site, other)[key_index]
+        g = groups.get(k)
+        if g is None:
+            g = groups[k] = {"calls": 0, "sites": []}
+        g["calls"] += 1
+        if len(g["sites"]) < max_sites:
+            g["sites"].append(hexa(site))
+    return sorted(groups.items(), key=lambda kv: -kv[1]["calls"])
+
+
+@tool("get_callers", "Who calls a function: each calling function with its name, how many call sites it has, and where they are (grouped — one entry per caller, most calls first). Paged.", {"address": ADDR, **PAGING}, ["address"])
+def t_callers(args):
+    ea = parse_ea(args.get("address"))
+    pfn = func_of(ea)
+    target = pfn.start_ea if pfn else ea
+    pairs = []
+    for x in idautils.XrefsTo(target):
+        if _is_call_xref(x):
+            pf = func_of(x.frm)
+            pairs.append((x.frm, pf.start_ea if pf else BADADDR))
+    items = []
+    for caller_ea, g in _group_calls(pairs, 1):
+        row = {"calls": g["calls"], "sites": g["sites"]}
+        if caller_ea == BADADDR:
+            row.update(function=None, address=None, note="call from outside any function")
+        else:
+            row.update(function=ida_funcs.get_func_name(caller_ea) or "", address=hexa(caller_ea))
+        items.append(row)
+    return {"address": hexa(target), "name": name_at(target), "total_call_sites": len(pairs), **page(items, args)}
+
+
+@tool("get_callees", "What a function calls: each target with its name, kind (function / import / thunk / data), how many times it is called from here, and the call sites (grouped, most calls first). The fastest way to see a function's dependencies without reading its code. Paged.", {"address": ADDR, **PAGING}, ["address"])
+def t_callees(args):
+    ea = parse_ea(args.get("address"))
+    pfn = func_of(ea)
+    if not pfn:
+        raise ToolError(f"{hexa(ea)} is not inside a function.")
+    pairs = _call_sites_of(pfn)
+    items = []
+    for target, g in _group_calls(pairs, 1):
+        name = name_at(target)
+        tf = func_of(target)
+        items.append({"address": hexa(target), "name": ida_funcs.get_func_name(tf.start_ea) if tf else (ida_name.demangle_name(name, 0) or name), "kind": _callee_kind(target), "calls": g["calls"], "sites": g["sites"]})
+    return {**func_summary(pfn), "total_call_sites": len(pairs), "distinct_targets": len(items), **page(items, args)}
+
+
+ADDR_LIST = {"type": "array", "items": {"type": "string"}, "description": "Addresses or names (max 50)."}
+
+
+def _addr_list(args, key: str = "addresses", max_n: int = 50) -> list:
+    raw = args.get(key)
+    if isinstance(raw, str):
+        raw = [p for p in re.split(r"[,\s]+", raw) if p]
+    if not isinstance(raw, list) or not raw:
+        raise ToolError(f"Give {key}: a list of addresses or names.")
+    return raw[:max_n]
+
+
+def _function_info(pfn) -> dict:
+    callers = sum(1 for x in idautils.XrefsTo(pfn.start_ea) if x.iscode)
+    chunks = [{"start": hexa(start), "end": hexa(end)} for start, end in idautils.Chunks(pfn.start_ea)]
+    f = pfn.flags
+    return {
+        **func_summary(pfn), "prototype": ida_typeinf.print_type(pfn.start_ea, ida_typeinf.PRTYPE_1LINE) or "",
+        "comment": ida_funcs.get_func_cmt(pfn, False) or "", "repeatable_comment": ida_funcs.get_func_cmt(pfn, True) or "",
+        "callers": callers, "chunks": chunks, "frame_size": ida_frame.get_frame_size(pfn),
+        "library": bool(f & ida_funcs.FUNC_LIB), "thunk": bool(f & ida_funcs.FUNC_THUNK), "noreturn": bool(f & ida_funcs.FUNC_NORET),
+        "decompilable": hexrays_ok(),
+    }
+
+
+@tool("get_functions", "Details of several functions in one call (same fields as get_function, one entry per address; an entry carries `error` when an address isn't a function). Up to 50.", {"addresses": ADDR_LIST}, ["addresses"])
+def t_functions_many(args):
+    out = []
+    for a in _addr_list(args):
+        try:
+            pfn = func_of(parse_ea(a))
+            if not pfn:
+                raise ToolError("not inside a function")
+            out.append(_function_info(pfn))
+        except ToolError as e:
+            out.append({"address": str(a), "error": str(e)})
+    return {"count": len(out), "items": out}
+
+
+def _decompile_one(ea: int, max_chars: int) -> dict:
+    pfn = func_of(ea)
+    if not pfn:
+        raise ToolError(f"{hexa(ea)} is not inside a function.")
+    try:
+        cfunc = ida_hexrays.decompile(pfn.start_ea)
+    except ida_hexrays.DecompilationFailure as e:
+        raise ToolError(f"Decompilation failed: {e}")
+    if cfunc is None:
+        raise ToolError("Decompilation failed (no result).")
+    code = str(cfunc)
+    out = {**func_summary(pfn), "code": code[:max_chars]}
+    if len(code) > max_chars:
+        out["truncated"] = True
+        out["chars"] = len(code)
+    return out
+
+
+@tool("decompile_many", "Hex-Rays pseudocode of several functions in one call (one entry per address, each with `code` or `error`). Up to 20 functions; stops early when budget_ms runs out and says which addresses are left in `remaining`.", {"addresses": {**ADDR_LIST, "description": "Functions (addresses or names), max 20."}, "max_chars_each": {"type": "integer", "description": "Cut each function's code at this many characters (default 20000)."}, "budget_ms": {"type": "integer", "description": "Time budget in milliseconds (default 60000)."}}, ["addresses"], chunked=True)
+def t_decompile_many(args):
+    if not hexrays_ok():
+        raise ToolError("The Hex-Rays decompiler isn't available in this IDA installation. Use disassemble.")
+    addrs = _addr_list(args, max_n=20)
+    max_chars = int_arg(args, "max_chars_each", 20000, 200, 200000)
+    deadline = budget_deadline(args, 60000)
+    items, i = [], 0
+    while i < len(addrs):
+        a = addrs[i]
+
+        def one():
+            try:
+                return _decompile_one(parse_ea(a), max_chars)
+            except ToolError as e:
+                return {"address": str(a), "error": str(e)}
+        items.append(on_main(one, label="decompile_many"))
+        i += 1
+        if time.monotonic() > deadline and i < len(addrs):
+            break
+    return {"count": len(items), "items": items, **({"remaining": [str(a) for a in addrs[i:]], "truncated": True} if i < len(addrs) else {})}
+
+
+@tool("get_pseudocode_lines", "Hex-Rays pseudocode as numbered lines, each with the address of the instruction it came from (when known) — so a finding can be tied back to an exact address and a comment can be placed on the right line. Needs the decompiler.", {"address": ADDR}, ["address"])
+def t_pseudocode_lines(args):
+    if not hexrays_ok():
+        raise ToolError("The Hex-Rays decompiler isn't available.")
+    ea = parse_ea(args.get("address"))
+    pfn = func_of(ea)
+    if not pfn:
+        raise ToolError(f"{hexa(ea)} is not inside a function.")
+    try:
+        cfunc = ida_hexrays.decompile(pfn.start_ea)
+    except ida_hexrays.DecompilationFailure as e:
+        raise ToolError(f"Decompilation failed: {e}")
+    if cfunc is None:
+        raise ToolError("Decompilation failed (no result).")
+    pseudocode = cfunc.get_pseudocode()  # generates the text; item coordinates exist only after this
+    line_ea: "dict[int, int]" = {}
+    for item in cfunc.treeitems:
+        iea = item.ea
+        if iea == BADADDR:
+            continue
+        try:
+            coords = cfunc.find_item_coords(item)
+        except Exception:
+            continue
+        if not coords:
+            continue
+        y = coords[1]
+        if y not in line_ea or iea < line_ea[y]:
+            line_ea[y] = iea
+    lines = []
+    for n, sl in enumerate(pseudocode):
+        row = {"line": n + 1, "text": ida_lines.tag_remove(sl.line)}
+        if n in line_ea:
+            row["address"] = hexa(line_ea[n])
+        lines.append(row)
+    return {**func_summary(pfn), "lines": lines}
+
+
+def _find_lvar(cfunc, name: str):
+    for lv in cfunc.get_lvars():
+        if lv.name == name:
+            return lv
+    return None
+
+
+def _parse_type(text: str):
+    tif = ida_typeinf.tinfo_t()
+    decl = text.strip().rstrip(";")
+    if not decl:
+        raise ToolError("Give the type (C syntax, e.g. \"struct Player *\" or \"unsigned int\").")
+    if ida_typeinf.parse_decl(tif, None, decl + ";", ida_typeinf.PT_SIL | ida_typeinf.PT_TYP) is None:
+        # Maybe a declaration with a name ("int x"): take its type.
+        if ida_typeinf.parse_decl(tif, None, decl + ";", ida_typeinf.PT_SIL) is None:
+            raise ToolError(f"Couldn't parse the type “{text}”.")
+    return tif
+
+
+@tool("set_lvar_type", "Set the type of a local variable or argument in a function's pseudocode (Hex-Rays), e.g. name=\"v3\", type=\"struct Player *\". The variable keeps its name.", {"function": ADDR, "name": {"type": "string"}, "type": {"type": "string", "description": "C type, e.g. \"int\", \"char *\", \"struct Foo *\"."}}, ["function", "name", "type"], write=True)
+def t_set_lvar_type(args):
+    if not hexrays_ok():
+        raise ToolError("The Hex-Rays decompiler isn't available.")
+    ea = parse_ea(args.get("function"), "function")
+    pfn = func_of(ea)
+    if not pfn:
+        raise ToolError(f"{hexa(ea)} is not inside a function.")
+    name = str(args.get("name") or "")
+    cfunc = ida_hexrays.decompile(pfn.start_ea)
+    lv = _find_lvar(cfunc, name) if cfunc else None
+    if lv is None:
+        raise ToolError(f"No variable called {name} in {ida_funcs.get_func_name(pfn.start_ea)} (decompile to see them).")
+    tif = _parse_type(str(args.get("type") or ""))
+    lsi = ida_hexrays.lvar_saved_info_t()
+    lsi.ll = lv
+    lsi.type = tif
+    if not ida_hexrays.modify_user_lvar_info(pfn.start_ea, ida_hexrays.MLI_TYPE, lsi):
+        raise ToolError(f"IDA refused the type {tif} for {name}.")
+    return {**func_summary(pfn), "name": name, "type": str(tif)}
+
+
+@tool("set_lvar_comment", "Set (or clear with an empty string) the comment shown next to a local variable's declaration in the pseudocode (Hex-Rays).", {"function": ADDR, "name": {"type": "string"}, "comment": {"type": "string"}}, ["function", "name", "comment"], write=True)
+def t_set_lvar_comment(args):
+    if not hexrays_ok():
+        raise ToolError("The Hex-Rays decompiler isn't available.")
+    ea = parse_ea(args.get("function"), "function")
+    pfn = func_of(ea)
+    if not pfn:
+        raise ToolError(f"{hexa(ea)} is not inside a function.")
+    name = str(args.get("name") or "")
+    cfunc = ida_hexrays.decompile(pfn.start_ea)
+    lv = _find_lvar(cfunc, name) if cfunc else None
+    if lv is None:
+        raise ToolError(f"No variable called {name} in {ida_funcs.get_func_name(pfn.start_ea)}.")
+    lsi = ida_hexrays.lvar_saved_info_t()
+    lsi.ll = lv
+    lsi.cmt = str(args.get("comment") or "")
+    if not ida_hexrays.modify_user_lvar_info(pfn.start_ea, ida_hexrays.MLI_CMT, lsi):
+        raise ToolError(f"Couldn't set the comment on {name}.")
+    return {**func_summary(pfn), "name": name, "comment": lsi.cmt}
+
+
+@tool("mark_as_noreturn", "Mark a function as never returning (like exit / abort / a panic handler) — or clear the mark with noreturn=false. Callers are re-analysed so code after their calls is treated correctly.", {"address": ADDR, "noreturn": {"type": "boolean", "description": "Default true."}}, ["address"], write=True)
+def t_noreturn(args):
+    ea = parse_ea(args.get("address"))
+    pfn = func_of(ea)
+    if not pfn:
+        raise ToolError(f"{hexa(ea)} is not inside a function.")
+    flag = args.get("noreturn", True)
+    flag = bool(flag) if not isinstance(flag, str) else flag.lower() not in ("false", "0", "no")
+    if flag:
+        pfn.flags |= ida_funcs.FUNC_NORET
+    else:
+        pfn.flags &= ~ida_funcs.FUNC_NORET
+    ida_funcs.update_func(pfn)
+    ida_auto.reanalyze_callers(pfn.start_ea, flag)
+    return {**func_summary(pfn), "noreturn": flag}
+
+
+CALLING_CONVENTIONS = {
+    "cdecl": "CM_CC_CDECL", "stdcall": "CM_CC_STDCALL", "fastcall": "CM_CC_FASTCALL", "thiscall": "CM_CC_THISCALL",
+    "pascal": "CM_CC_PASCAL", "usercall": "CM_CC_SPECIAL", "userpurge": "CM_CC_SPECIALP", "ellipsis": "CM_CC_ELLIPSIS",
+    "unknown": "CM_CC_UNKNOWN",
+}
+
+
+@tool("set_calling_convention", "Change a function's calling convention (cdecl, stdcall, fastcall, thiscall, pascal, usercall, userpurge) keeping its return type and arguments. On x64 Windows, fastcall is the normal convention.", {"address": ADDR, "convention": {"type": "string", "enum": list(CALLING_CONVENTIONS)}}, ["address", "convention"], write=True)
+def t_set_cc(args):
+    ea = parse_ea(args.get("address"))
+    pfn = func_of(ea)
+    if not pfn:
+        raise ToolError(f"{hexa(ea)} is not inside a function.")
+    conv = str(args.get("convention") or "").lower().lstrip("_")
+    const = CALLING_CONVENTIONS.get(conv)
+    if not const:
+        raise ToolError(f"Unknown convention {conv!r}; one of {', '.join(CALLING_CONVENTIONS)}.")
+    tif = ida_typeinf.tinfo_t()
+    if not ida_nalt.get_tinfo(tif, pfn.start_ea):
+        if ida_typeinf.guess_tinfo(tif, pfn.start_ea) != ida_typeinf.GUESS_FUNC_OK:
+            raise ToolError("IDA has no prototype for this function yet — set_type one first.")
+    fi = ida_typeinf.func_type_data_t()
+    if not tif.get_func_details(fi):
+        raise ToolError("Couldn't read the function's prototype.")
+    fi.cc = (fi.cc & ~ida_typeinf.CM_CC_MASK) | getattr(ida_typeinf, const)
+    new_tif = ida_typeinf.tinfo_t()
+    if not new_tif.create_func(fi) or not ida_typeinf.apply_tinfo(pfn.start_ea, new_tif, ida_typeinf.TINFO_DEFINITE):
+        raise ToolError("IDA refused the new prototype.")
+    return {**func_summary(pfn), "convention": conv, "prototype": ida_typeinf.print_type(pfn.start_ea, ida_typeinf.PRTYPE_1LINE) or ""}
+
+
+# ───────────────────────── structure recovery ─────────────────────────
+
+_FRAME_REGS = {"rbp", "rsp", "ebp", "esp", "sp", "fp", "x29", "r11"}
+_SIZE_TYPES = {1: "unsigned __int8", 2: "unsigned __int16", 4: "unsigned __int32", 8: "unsigned __int64", 16: "__m128"}
+
+
+def _operand_access(ea: int, n: int, op, insn):
+    """A memory operand [reg+off] → (base register, offset, size, is_write) or None."""
+    if op.type not in (ida_ua.o_displ, ida_ua.o_phrase):
+        return None
+    text = ida_lines.tag_remove(ida_ua.print_operand(ea, n) or "")
+    m = re.search(r"\[([^\]]+)\]", text)
+    if not m:
+        return None
+    parts = [p.strip() for p in re.split(r"\+", m.group(1))]
+    if not parts:
+        return None
+    base = parts[0].lower()
+    if not re.fullmatch(r"[a-z][a-z0-9]{0,4}", base) or base in _FRAME_REGS:
+        return None
+    off = 0
+    for p in parts[1:]:
+        pl = p.lower()
+        if re.fullmatch(r"[0-9a-f]+h", pl):
+            off += int(pl[:-1], 16)
+        elif re.fullmatch(r"\d+", pl):
+            off += int(pl)
+        elif re.fullmatch(r"[a-z][a-z0-9]{0,4}(\*\d)?", pl):
+            continue  # an index register: still the same base object
+        else:
+            return None  # a stack variable, a named global, …
+    size = ida_ua.get_dtype_size(op.dtype) or 0
+    feature = insn.get_canon_feature()
+    is_write = bool(feature & getattr(ida_idp, f"CF_CHG{n + 1}", 0))
+    return base, off, size, is_write
+
+
+@tool("suggest_struct_from_accesses", "Recover a structure from how a function uses a pointer: every [register+offset] memory access in the function is collected per base register, and for the busiest registers (or the one you name) a draft C struct is returned with a field per distinct offset (typed by access size), plus the access list (offset, size, read/write, where). Edit the draft and feed it to declare_types, then set_type / set_lvar_type the pointer.", {"address": ADDR, "register": {"type": "string", "description": "Only this base register (e.g. rcx). Default: the 3 most-used."}, "name": {"type": "string", "description": "Name for the draft struct (default: from the function)."}}, ["address"])
+def t_suggest_struct(args):
+    ea = parse_ea(args.get("address"))
+    pfn = func_of(ea)
+    if not pfn:
+        raise ToolError(f"{hexa(ea)} is not inside a function.")
+    want = str(args.get("register") or "").lower() or None
+    per_reg: "dict[str, list]" = {}
+    insn = ida_ua.insn_t()
+    for h in idautils.FuncItems(pfn.start_ea):
+        if not ida_ua.decode_insn(insn, h):
+            continue
+        for n in range(8):
+            op = insn.ops[n]
+            if op.type == ida_ua.o_void:
+                break
+            acc = _operand_access(h, n, op, insn)
+            if not acc:
+                continue
+            base, off, size, is_write = acc
+            if want and base != want:
+                continue
+            per_reg.setdefault(base, []).append({"offset": off, "size": size, "access": "write" if is_write else "read", "at": hexa(h)})
+    if not per_reg:
+        raise ToolError("No [register+offset] accesses in this function" + (f" through {want}" if want else "") + ".")
+    fname = ida_funcs.get_func_name(pfn.start_ea) or hexa(pfn.start_ea)
+    base_name = str(args.get("name") or "").strip() or re.sub(r"\W+", "_", fname) + "_obj"
+    regs = sorted(per_reg.items(), key=lambda kv: -len(kv[1]))[: (1 if want else 3)]
+    results = []
+    for reg, accesses in regs:
+        fields: "dict[int, int]" = {}
+        for a in accesses:
+            fields[a["offset"]] = max(fields.get(a["offset"], 0), a["size"] or 0)
+        lines, last_end = [], 0
+        for off in sorted(fields):
+            size = fields[off] or 1
+            if off > last_end:
+                lines.append(f"  unsigned __int8 gap_{last_end:X}[{off - last_end}];")
+            ctype = _SIZE_TYPES.get(size)
+            lines.append(f"  {ctype} field_{off:X};" if ctype else f"  unsigned __int8 field_{off:X}[{size}];")
+            last_end = off + size
+        sname = base_name if len(regs) == 1 else f"{base_name}_{reg}"
+        results.append({
+            "register": reg, "accesses": len(accesses), "fields": len(fields), "size": last_end,
+            "struct_c": f"struct {sname} {{\n" + "\n".join(lines) + "\n};",
+            "access_list": sorted(accesses, key=lambda a: (a["offset"], a["at"]))[:400],
+        })
+    return {**func_summary(pfn), "registers": results}
+
+
+# ───────────────────────── signatures and similar code ─────────────────────────
+
+@tool("list_signatures", "FLIRT signatures applied to this database: name, library, how many functions each matched.")
+def t_list_sigs(args):
+    out = []
+    for i in range(ida_funcs.get_idasgn_qty()):
+        try:
+            d = ida_funcs.get_idasgn_desc_with_matches(i)
+            out.append({"index": i, "name": d[0], "library": d[1], "matches": d[2]})
+        except Exception:
+            d = ida_funcs.get_idasgn_desc(i)
+            out.append({"index": i, "name": d[0], "library": d[1]})
+    return {"count": len(out), "signatures": out}
+
+
+@tool("apply_signature", "Apply a FLIRT signature file (from IDA's sig folder, e.g. \"vc64ucrt\" or \"vc64seh\") to recognise library functions. The matching runs in IDA's auto-analysis: call wait_for_analysis, then list_signatures to see how many matched.", {"name": {"type": "string", "description": "Signature file name without extension (e.g. vc64ucrt)."}}, ["name"], write=True)
+def t_apply_sig(args):
+    name = str(args.get("name") or "").strip()
+    if not name:
+        raise ToolError("Give the signature name.")
+    r = ida_funcs.plan_to_apply_idasgn(name)
+    if not r:
+        raise ToolError(f"IDA couldn't find or queue the signature {name!r} (look in IDA's sig/<processor> folder for the file name).")
+    return {"name": name, "queued": True, "signature_index": r}
+
+
+def _func_sig(pfn) -> list:
+    """Instruction shape of a function: canonical mnemonic + operand kinds, one token per instruction."""
+    insn = ida_ua.insn_t()
+    toks = []
+    for h in idautils.FuncItems(pfn.start_ea):
+        if not ida_ua.decode_insn(insn, h):
+            continue
+        kinds = []
+        for n in range(8):
+            t = insn.ops[n].type
+            if t == ida_ua.o_void:
+                break
+            kinds.append(str(t))
+        toks.append(insn.get_canon_mnem() + ":" + ",".join(kinds))
+    return toks
+
+
+def _ngrams(toks: list, n: int = 3) -> set:
+    if len(toks) < n:
+        return {tuple(toks)} if toks else set()
+    return {tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)}
+
+
+@tool("find_similar_functions", "Functions whose code looks like a given one (same instruction shapes, ignoring addresses and register names — finds inlined / duplicated / templated copies). Compares functions of comparable size, scores by shared instruction trigrams (0..1), returns the best matches. Stops when budget_ms runs out and says how far it got.", {"address": ADDR, "limit": {"type": "integer", "description": "Best N matches (default 10)."}, "min_similarity": {"type": "number", "description": "0..1, default 0.5."}, "budget_ms": {"type": "integer", "description": "Time budget in milliseconds (default 20000)."}}, ["address"], chunked=True)
+def t_similar(args):
+    limit = int_arg(args, "limit", 10, 1, 100)
+    try:
+        min_sim = float(args.get("min_similarity", 0.5))
+    except (TypeError, ValueError):
+        raise ToolError("min_similarity must be a number between 0 and 1.")
+    deadline = budget_deadline(args, 20000)
+
+    def setup():
+        pfn = func_of(parse_ea(args.get("address")))
+        if not pfn:
+            raise ToolError("Not inside a function.")
+        toks = _func_sig(pfn)
+        if len(toks) < 3:
+            raise ToolError("The function is too small to compare (fewer than 3 instructions).")
+        return func_summary(pfn), pfn.start_ea, _ngrams(toks), len(toks), list(idautils.Functions())
+    me, me_ea, me_grams, me_len, all_funcs = on_main(setup, label="find_similar_functions")
+    lo, hi = me_len * 0.5, me_len * 2.0
+    found, i, scanned, WINDOW = [], 0, 0, 300
+    while i < len(all_funcs):
+        chunk = all_funcs[i:i + WINDOW]
+
+        def window():
+            res, n = [], 0
+            for fea in chunk:
+                if fea == me_ea:
+                    continue
+                pfn = ida_funcs.get_func(fea)
+                if not pfn:
+                    continue
+                # Cheap size gate before decoding anything.
+                if not (lo * 2 <= (pfn.end_ea - pfn.start_ea) <= hi * 16):
+                    continue
+                toks = _func_sig(pfn)
+                n += 1
+                if not (lo <= len(toks) <= hi):
+                    continue
+                g = _ngrams(toks)
+                inter = len(me_grams & g)
+                if not inter:
+                    continue
+                sim = inter / len(me_grams | g)
+                if sim >= min_sim:
+                    res.append({"address": hexa(pfn.start_ea), "name": ida_funcs.get_func_name(pfn.start_ea) or "", "size": pfn.end_ea - pfn.start_ea, "instructions": len(toks), "similarity": round(sim, 3)})
+            return res, n
+        res, n = on_main(window, label="find_similar_functions")
+        found.extend(res)
+        scanned += n
+        i += WINDOW
+        if time.monotonic() > deadline and i < len(all_funcs):
+            break
+    found.sort(key=lambda r: -r["similarity"])
+    return {"function": me, "instructions": me_len, "compared": scanned, "functions_total": len(all_funcs), "matches": found[:limit], **({"truncated": True, "scanned_up_to": i} if i < len(all_funcs) else {})}
+
+
+# ───────────────────────── data ─────────────────────────
+
+def _int_at(ea: int, size: int) -> "int | None":
+    b = ida_bytes.get_bytes(ea, size)
+    return int.from_bytes(b, "little") if b and len(b) == size else None
+
+
+@tool("get_data_item", "What is at a data address, decoded: a string (its text and encoding), a number / array (each element's value), a pointer (and what it points to), a structure instance (each member's value), or code (the instruction). Also the item's name, size, type and how many places reference it.", {"address": ADDR, "max_elements": {"type": "integer", "description": "For arrays, default 64."}}, ["address"])
+def t_data_item(args):
+    ea = parse_ea(args.get("address"))
+    check_in_db(ea)
+    head = ida_bytes.get_item_head(ea)
+    flags = ida_bytes.get_flags(head)
+    size = ida_bytes.get_item_size(head)
+    out = {"address": hexa(head), "name": name_at(head), "size": size, "references": sum(1 for _ in idautils.XrefsTo(head))}
+    if head != ea:
+        out["note"] = f"{hexa(ea)} is inside the item that starts at {hexa(head)}"
+    tif = ida_typeinf.tinfo_t()
+    if ida_nalt.get_tinfo(tif, head):
+        out["type"] = str(tif)
+    if ida_bytes.is_code(flags):
+        out.update(kind="code", text=(ida_lines.generate_disasm_line(head, ida_lines.GENDSM_REMOVE_TAGS) or "").strip())
+        pf = func_of(head)
+        if pf:
+            out["function"] = func_summary(pf)
+        return out
+    if ida_bytes.is_strlit(flags):
+        st = ida_nalt.get_str_type(head)
+        raw = ida_bytes.get_strlit_contents(head, size, st) or b""
+        enc = "utf-16" if (st & 0xFF) in (ida_nalt.STRTYPE_C_16, ida_nalt.STRTYPE_PASCAL_16, ida_nalt.STRTYPE_LEN2_16) else ("utf-32" if (st & 0xFF) == ida_nalt.STRTYPE_C_32 else "utf-8")
+        try:
+            text = raw.decode(enc, errors="replace") if enc != "utf-8" else raw.decode("utf-8", errors="replace")
+        except Exception:
+            text = raw.decode("latin-1", errors="replace")
+        out.update(kind="string", encoding=enc, text=text[:20000], length=len(text))
+        return out
+    if ida_bytes.is_struct(flags):
+        udt = ida_typeinf.udt_type_data_t()
+        members = []
+        if tif.is_struct() and tif.get_udt_details(udt):
+            for m in udt:
+                off, msize = m.offset // 8, max(1, m.size // 8)
+                row = {"name": m.name, "offset": off, "size": msize, "type": str(m.type)}
+                v = _int_at(head + off, msize) if msize <= 8 else None
+                if v is not None:
+                    row["value"] = v
+                    row["hex"] = hexa(v)
+                else:
+                    b = ida_bytes.get_bytes(head + off, min(msize, 64)) or b""
+                    row["hex"] = b.hex(" ")
+                members.append(row)
+        out.update(kind="struct", members=members)
+        return out
+    if ida_bytes.is_data(flags):
+        elsize = ida_bytes.get_data_elsize(head, flags) or 1
+        count = max(1, size // elsize)
+        max_el = int_arg(args, "max_elements", 64, 1, 4096)
+        values = []
+        is_float = ida_bytes.is_float(flags) or ida_bytes.is_double(flags)
+        for i in range(min(count, max_el)):
+            at = head + i * elsize
+            if is_float and elsize in (4, 8):
+                b = ida_bytes.get_bytes(at, elsize)
+                values.append(struct.unpack("<f" if elsize == 4 else "<d", b)[0] if b else None)
+            else:
+                v = _int_at(at, elsize) if elsize <= 8 else None
+                values.append(hexa(v) if v is not None else (ida_bytes.get_bytes(at, elsize) or b"").hex())
+        out.update(kind="float" if is_float else "data", element_size=elsize, count=count, values=values)
+        if count > max_el:
+            out["truncated"] = True
+        if ida_bytes.is_off0(flags) and elsize in (4, 8):
+            targets = []
+            for i in range(min(count, max_el)):
+                v = _int_at(head + i * elsize, elsize)
+                if v is not None:
+                    targets.append({"address": hexa(v), "name": name_at(v)})
+            out.update(kind="pointer", targets=targets)
+        if elsize == 1 and count > 1:
+            b = ida_bytes.get_bytes(head, min(size, 256)) or b""
+            out["ascii"] = "".join(chr(x) if 32 <= x < 127 else "." for x in b)
+        return out
+    b = ida_bytes.get_bytes(head, min(max(size, 16), 64)) or b""
+    out.update(kind="undefined", hex=b.hex(" "), ascii="".join(chr(x) if 32 <= x < 127 else "." for x in b))
+    return out
+
+
+# ───────────────────────── bookmarks ─────────────────────────
+
+MAX_BOOKMARKS = 1024
+
+
+def _bookmarks() -> list:
+    out = []
+    for slot in range(1, MAX_BOOKMARKS + 1):
+        ea = ida_idc.get_marked_pos(slot)
+        if ea == BADADDR:
+            continue
+        pf = func_of(ea)
+        out.append({"slot": slot, "address": hexa(ea), "name": name_at(ea), "description": ida_idc.get_mark_comment(slot) or "", **({"function": ida_funcs.get_func_name(pf.start_ea)} if pf else {})})
+    return out
+
+
+@tool("list_bookmarks", "IDA's bookmarks (Ctrl-M marks): slot, address, name, description, function.")
+def t_list_bookmarks(args):
+    bm = _bookmarks()
+    return {"count": len(bm), "bookmarks": bm}
+
+
+@tool("add_bookmark", "Add an IDA bookmark at an address with a description — a trail the user can walk with Ctrl-M. Returns the slot.", {"address": ADDR, "description": {"type": "string"}}, ["address", "description"], write=True)
+def t_add_bookmark(args):
+    ea = parse_ea(args.get("address"))
+    check_in_db(ea)
+    desc = str(args.get("description") or "").strip() or name_at(ea) or hexa(ea)
+    for slot in range(1, MAX_BOOKMARKS + 1):
+        if ida_idc.get_marked_pos(slot) == BADADDR:
+            ida_idc.mark_position(ea, 0, 0, 0, slot, desc)
+            if ida_idc.get_marked_pos(slot) != ea:
+                raise ToolError("IDA didn't keep the bookmark.")
+            return {"slot": slot, "address": hexa(ea), "description": desc}
+    raise ToolError("All 1024 bookmark slots are used.")
+
+
+@tool("delete_bookmark", "Remove an IDA bookmark by slot (see list_bookmarks).", {"slot": {"type": "integer"}}, ["slot"], write=True)
+def t_del_bookmark(args):
+    slot = int_arg(args, "slot", 0, 1, MAX_BOOKMARKS)
+    ea = ida_idc.get_marked_pos(slot)
+    if ea == BADADDR:
+        raise ToolError(f"No bookmark in slot {slot}.")
+    desc = ida_idc.get_mark_comment(slot) or ""
+    before = len(_bookmarks())
+    ida_idc.mark_position(BADADDR, 0, 0, 0, slot, "")
+    after = len(_bookmarks())
+    # IDA erases the entry and shifts the ones above it down a slot.
+    return {"slot": slot, "was": hexa(ea), "description": desc, "deleted": after < before, "bookmarks_left": after, "note": "bookmarks in higher slots moved down by one" if after < before and after >= slot else ""}
+
+
+# ───────────────────────── debugger control ─────────────────────────
+
+DBG_EVENTS = None
+
+
+def _dbg_event_name(code: int) -> str:
+    global DBG_EVENTS
+    if DBG_EVENTS is None:
+        DBG_EVENTS = {}
+        for n in ("NO_EVENT", "PROCESS_STARTED", "PROCESS_EXITED", "THREAD_STARTED", "THREAD_EXITED", "BREAKPOINT", "STEP", "EXCEPTION", "LIB_LOADED", "LIB_UNLOADED", "INFORMATION", "PROCESS_ATTACHED", "PROCESS_DETACHED", "PROCESS_SUSPENDED", "TRACE_FULL"):
+            v = getattr(ida_idd, n, None)
+            if isinstance(v, int):
+                DBG_EVENTS[v] = n.lower()
+    if code == -1:
+        return "timeout"
+    return DBG_EVENTS.get(code, str(code))
+
+
+def _dbg_snapshot() -> dict:
+    base = t_dbg({})
+    if not base.get("debugger_on"):
+        return base
+    if base.get("state") == "suspended":
+        ip = ida_dbg.get_ip_val()
+        if ip is not None and ip != BADADDR:
+            base["ip"] = hexa(int(ip))
+            base["instruction"] = (ida_lines.generate_disasm_line(int(ip), ida_lines.GENDSM_REMOVE_TAGS) or "").strip()
+            pf = func_of(int(ip))
+            if pf:
+                base["function"] = func_summary(pf)
+        sp = ida_dbg.get_sp_val()
+        if sp is not None and sp != BADADDR:
+            base["sp"] = hexa(int(sp))
+    return base
+
+
+def _wait_suspended(timeout_s: float) -> dict:
+    code = ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, int(max(1, timeout_s)))
+    return {"event": _dbg_event_name(code), **_dbg_snapshot()}
+
+
+def _timeout_arg(args, default: int = 15) -> int:
+    return int_arg(args, "timeout_s", default, 1, 120)
+
+
+@tool("debugger_start", "Start the program under IDA's debugger (the one selected in IDA, win32 by default on Windows) and run until it is suspended: at break_at (a temporary stop), at the first breakpoint, or at the process entry if IDA is set to stop there. This RUNS the binary on this PC. Returns the stop event, the current instruction and the registers.", {"path": {"type": "string", "description": "Executable to run (default: the database's input file)."}, "args": {"type": "string", "description": "Command line."}, "directory": {"type": "string", "description": "Working directory."}, "break_at": ADDR, "timeout_s": {"type": "integer", "description": "How long to wait for the stop (default 15, max 120)."}}, write=True, destructive=True)
+def t_dbg_start(args):
+    if ida_dbg.is_debugger_on():
+        raise ToolError("A process is already being debugged (debugger_stop first).")
+    if ida_idd.get_dbg() is None:
+        name = "win32" if sys.platform == "win32" else ("mac" if sys.platform == "darwin" else "linux")
+        if not ida_dbg.load_debugger(name, False):
+            raise ToolError(f"Couldn't load the {name} debugger — pick one in IDA (Debugger → Select debugger).")
+    path = str(args.get("path") or "")
+    cmdline = str(args.get("args") or "")
+    sdir = str(args.get("directory") or "")
+    if path or cmdline or sdir:
+        ida_dbg.set_process_options(path or ida_nalt.get_input_file_path(), cmdline, sdir, "", "", 0)
+    if args.get("break_at"):
+        ea = parse_ea(args["break_at"], "break_at")
+        if not ida_dbg.run_to(ea):
+            raise ToolError("IDA couldn't start the process (run_to failed) — check Debugger → Process options.")
+    else:
+        r = ida_dbg.start_process(path, cmdline, sdir)
+        if r == 0:
+            raise ToolError("Starting the process was cancelled in IDA.")
+        if r != 1:
+            raise ToolError("IDA couldn't start the process — check Debugger → Process options and the debugger's log.")
+    return _wait_suspended(_timeout_arg(args))
+
+
+@tool("debugger_attach", "Attach IDA's debugger to a running process by pid and suspend it.", {"pid": {"type": "integer"}, "timeout_s": {"type": "integer"}}, ["pid"], write=True, destructive=True)
+def t_dbg_attach(args):
+    if ida_dbg.is_debugger_on():
+        raise ToolError("A process is already being debugged (debugger_stop first).")
+    pid = int_arg(args, "pid", 0, 1, 1 << 31)
+    if ida_idd.get_dbg() is None:
+        name = "win32" if sys.platform == "win32" else ("mac" if sys.platform == "darwin" else "linux")
+        if not ida_dbg.load_debugger(name, False):
+            raise ToolError(f"Couldn't load the {name} debugger.")
+    r = ida_dbg.attach_process(pid, -1)
+    if r != 1:
+        raise ToolError(f"Couldn't attach to pid {pid} (result {r}).")
+    return _wait_suspended(_timeout_arg(args))
+
+
+@tool("debugger_step", "Drive the debugged process: action = step_over, step_into, step_out (run until the current function returns), continue (run until a breakpoint / exception / exit), or run_to (run until `address`). Waits up to timeout_s for the process to stop again and returns where it is (event, instruction, registers). A `timeout` event means it is still running.", {"action": {"type": "string", "enum": ["step_over", "step_into", "step_out", "continue", "run_to"]}, "address": {**ADDR, "description": "For run_to: where to stop."}, "timeout_s": {"type": "integer", "description": "Default 15, max 120."}}, ["action"], write=True)
+def t_dbg_step(args):
+    if not ida_dbg.is_debugger_on():
+        raise ToolError("The debugger isn't running (debugger_start or debugger_attach first).")
+    action = str(args.get("action") or "")
+    if ida_dbg.get_process_state() != ida_dbg.DSTATE_SUSP and action != "continue":
+        raise ToolError("The process is running — it must be suspended to step (wait for a breakpoint, or debugger_stop).")
+    ok = True
+    if action == "step_over":
+        ok = ida_dbg.step_over()
+    elif action == "step_into":
+        ok = ida_dbg.step_into()
+    elif action == "step_out":
+        ok = ida_dbg.step_until_ret()
+    elif action == "continue":
+        ok = ida_dbg.continue_process()
+    elif action == "run_to":
+        ok = ida_dbg.run_to(parse_ea(args.get("address")))
+    else:
+        raise ToolError("action must be step_over, step_into, step_out, continue or run_to.")
+    if not ok:
+        raise ToolError(f"IDA refused {action}.")
+    return {"action": action, **_wait_suspended(_timeout_arg(args))}
+
+
+@tool("debugger_stop", "End the debugging session: kill the process (default) or detach from it and let it run.", {"detach": {"type": "boolean", "description": "true: detach instead of killing."}}, write=True, destructive=True)
+def t_dbg_stop(args):
+    if not ida_dbg.is_debugger_on():
+        return {"debugger_on": False, "note": "nothing was being debugged"}
+    detach = bool(args.get("detach"))
+    ok = ida_dbg.detach_process() if detach else ida_dbg.exit_process()
+    code, deadline = -1, time.monotonic() + 15
+    while ida_dbg.is_debugger_on() and time.monotonic() < deadline:
+        code = ida_dbg.wait_for_next_event(ida_dbg.WFNE_ANY, 2)
+        if code in (getattr(ida_idd, "PROCESS_EXITED", -2), getattr(ida_idd, "PROCESS_DETACHED", -3)):
+            break
+    return {"stopped": bool(ok), "detached": detach, "last_event": _dbg_event_name(code), "debugger_on": ida_dbg.is_debugger_on()}
+
+
+def _bpt_row(b) -> dict:
+    return {"address": hexa(b.ea), "enabled": b.enabled(), "type": {ida_idd.BPT_SOFT: "software", ida_idd.BPT_EXEC: "hardware exec", ida_idd.BPT_WRITE: "hardware write", ida_idd.BPT_READ: "hardware read", ida_idd.BPT_RDWR: "hardware read/write"}.get(b.type, str(b.type)), "size": b.size, "condition": b.condition or "", "pass_count": b.pass_count, "name": name_at(b.ea)}
+
+
+@tool("list_breakpoints", "The debugger's breakpoints: address, enabled, type, size, condition, pass count.")
+def t_list_bpts(args):
+    out = []
+    for i in range(ida_dbg.get_bpt_qty()):
+        b = ida_dbg.bpt_t()
+        if ida_dbg.getn_bpt(i, b):
+            out.append(_bpt_row(b))
+    return {"count": len(out), "breakpoints": out}
+
+
+@tool("set_breakpoint", "Add (or update) a breakpoint at an address: software by default, or a hardware read / write / access breakpoint on data with kind=write|read|access and size. Optional IDC condition (e.g. \"rcx == 5\"), enabled flag.", {"address": ADDR, "kind": {"type": "string", "enum": ["software", "exec", "write", "read", "access"]}, "size": {"type": "integer", "description": "Bytes watched by a hardware breakpoint (1, 2, 4, 8)."}, "condition": {"type": "string"}, "enabled": {"type": "boolean"}}, ["address"], write=True)
+def t_set_bpt(args):
+    ea = parse_ea(args.get("address"))
+    kind = str(args.get("kind") or "software")
+    btype = {"software": ida_idd.BPT_SOFT, "exec": ida_idd.BPT_EXEC, "write": ida_idd.BPT_WRITE, "read": ida_idd.BPT_READ, "access": ida_idd.BPT_RDWR}.get(kind)
+    if btype is None:
+        raise ToolError("kind must be software, exec, write, read or access.")
+    size = int_arg(args, "size", 0 if btype == ida_idd.BPT_SOFT else 1, 0, 8)
+    existing = ida_dbg.bpt_t()
+    if not ida_dbg.get_bpt(ea, existing):
+        if not ida_dbg.add_bpt(ea, size, btype):
+            raise ToolError(f"IDA couldn't add a breakpoint at {hexa(ea)} (hardware breakpoints need a running process and a free debug register).")
+    b = ida_dbg.bpt_t()
+    ida_dbg.get_bpt(ea, b)
+    changed = False
+    if "condition" in args:
+        b.condition = str(args.get("condition") or "")
+        changed = True
+    if changed and not ida_dbg.update_bpt(b):
+        raise ToolError("Couldn't update the breakpoint.")
+    if "enabled" in args:
+        ida_dbg.enable_bpt(ea, bool(args.get("enabled")))
+    ida_dbg.get_bpt(ea, b)
+    return _bpt_row(b)
+
+
+@tool("delete_breakpoint", "Remove the breakpoint at an address.", {"address": ADDR}, ["address"], write=True)
+def t_del_bpt(args):
+    ea = parse_ea(args.get("address"))
+    if not ida_dbg.del_bpt(ea):
+        raise ToolError(f"No breakpoint at {hexa(ea)}.")
+    return {"address": hexa(ea), "deleted": True}
+
+
+@tool("set_register", "Set a register of the suspended process (e.g. rax = 0, rip = an address).", {"name": {"type": "string"}, "value": {"type": "string", "description": "Hex (0x…) or decimal."}}, ["name", "value"], write=True)
+def t_set_reg(args):
+    if not ida_dbg.is_debugger_on() or ida_dbg.get_process_state() != ida_dbg.DSTATE_SUSP:
+        raise ToolError("The process must be suspended under the debugger.")
+    name = str(args.get("name") or "").strip()
+    v = args.get("value")
+    try:
+        val = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else int(str(v).strip(), 0)
+    except (TypeError, ValueError):
+        raise ToolError("value must be a number (hex 0x… or decimal).")
+    if not ida_dbg.set_reg_val(name, val):
+        raise ToolError(f"Couldn't set {name} (unknown register?).")
+    return {"name": name, "value": hexa(val), "now": ida_dbg.get_reg_val(name)}
+
+
+@tool("write_memory", "Write bytes into the debugged process's memory (hex, e.g. \"90 90\"). Only the live process changes — the database is untouched (patch_bytes changes the database).", {"address": ADDR, "hex": {"type": "string"}}, ["address", "hex"], write=True, destructive=True)
+def t_write_mem(args):
+    if not ida_dbg.is_debugger_on():
+        raise ToolError("The debugger isn't running.")
+    ea = parse_ea(args.get("address"))
+    try:
+        data = bytes.fromhex(re.sub(r"[^0-9a-fA-F]", "", str(args.get("hex") or "")))
+    except ValueError:
+        raise ToolError("hex must be hex bytes, e.g. \"90 90\".")
+    if not data:
+        raise ToolError("Give the bytes.")
+    n = ida_idd.dbg_write_memory(ea, data)
+    if n is False or n is None or (isinstance(n, int) and n <= 0 and n is not True):
+        raise ToolError(f"Couldn't write {len(data)} bytes at {hexa(ea)} in the process.")
+    back = ida_idd.dbg_read_memory(ea, len(data)) or b""
+    return {"address": hexa(ea), "size": len(data), "now": back.hex(" ")}
+
+
 # ───────────────────────── MCP (JSON-RPC 2.0 over HTTP) ─────────────────────────
 
 class _State:
@@ -873,10 +1811,16 @@ def handle_rpc(msg: dict) -> "dict | None":
         args = params.get("arguments") or {}
         if not isinstance(args, dict):
             return rpc_error(id_, -32602, "arguments must be an object")
+        known = set(t["def"]["inputSchema"]["properties"])
+        ignored = sorted(k for k in args if k not in known)
+        if ignored:  # a model that invents arguments (e.g. "action") still gets its call
+            args = {k: v for k, v in args.items() if k in known}
         _state.calls += 1
         started = time.monotonic()
         try:
-            result = _executor.run(lambda: t["fn"](args), t["write"], name)
+            result = t["fn"](args) if t.get("chunked") else _executor.run(lambda: t["fn"](args), t["write"], name)
+            if ignored and isinstance(result, dict):
+                result["ignored_arguments"] = ignored
             text = json.dumps(result, ensure_ascii=False, default=str)
             log(f"{name} ok ({(time.monotonic() - started) * 1000:.0f} ms)")
             return {"jsonrpc": "2.0", "id": id_, "result": {"content": [{"type": "text", "text": text}], "structuredContent": result if isinstance(result, dict) else {"result": result}}}

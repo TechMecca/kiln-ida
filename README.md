@@ -4,14 +4,16 @@
 [Model Context Protocol](https://modelcontextprotocol.io) (Streamable HTTP). It was written for
 [Kiln](https://github.com/TechMecca/kiln-releases), where `/ida` attaches one or more running IDA
 sessions to a chat and the model works on the real database: functions, pseudocode, assembly,
-cross-references, imports, exports, strings, segments, names, types, stack frames, memory, the
-debugger, navigation — and, with your permission per call, renames, comments, types, new functions,
-patches and IDAPython.
+cross-references, callers and callees, imports, exports, strings, segments, names, types, data,
+stack frames, memory, bookmarks, the debugger, navigation — and, with your permission per call,
+renames, comments, types, local variables, calling conventions, new functions, patches, breakpoints,
+running / stepping the program, and IDAPython.
 
 Any MCP client that speaks Streamable HTTP can use it; the session file (below) has the URL and key.
 
-- IDA Pro **9.1** (SDK 910) with IDAPython on Python 3.10+. Hex-Rays is optional (`decompile` and
-  `rename_local_variable` need it).
+- IDA Pro **9.1** (SDK 910) with IDAPython on Python 3.10+. Hex-Rays is optional (`decompile`,
+  `decompile_many`, `get_pseudocode_lines`, `rename_local_variable`, `set_lvar_type`,
+  `set_lvar_comment` need it).
 - Standard library only — nothing to `pip install`.
 - Windows is what it is tested on. The code has no Windows-only parts except the process-liveness
   check, which falls back to `os.kill(pid, 0)` elsewhere.
@@ -28,7 +30,7 @@ Any MCP client that speaks Streamable HTTP can use it; the session file (below) 
    the Output window shows:
 
    ```
-   [Kiln IDA] server ON — session 50a47088 at http://127.0.0.1:24137/mcp (33 tools, Hex-Rays yes)
+   [Kiln IDA] server ON — session 50a47088 at http://127.0.0.1:24137/mcp (59 tools, Hex-Rays yes)
    ```
 
 3. In Kiln, type `/ida` in any chat, tick the session, Done. The chip above the composer shows
@@ -56,13 +58,13 @@ While the server is on, the plugin keeps `%APPDATA%\Kiln\ida\sessions\<id>.json`
 
 ```json
 {
-  "id": "50a47088", "plugin": "kiln-ida", "version": "0.1.0",
+  "id": "50a47088", "plugin": "kiln-ida", "version": "0.2.0",
   "name": "whoami.exe", "binary": "whoami.exe",
   "input_path": "C:\\dumps\\whoami.exe", "idb_path": "C:\\dumps\\whoami.exe.i64",
   "pid": 10216, "host": "127.0.0.1", "port": 24137, "url": "http://127.0.0.1:24137/mcp",
   "token": "…secret…", "ida_version": "9.1", "sdk": 910, "python": "3.10.5",
   "hexrays": true, "processor": "metapc", "bits": 64, "gui": true,
-  "started_at": "2026-10-13T10:00:00Z", "tools": 33
+  "started_at": "2026-10-13T10:00:00Z", "tools": 59
 }
 ```
 
@@ -93,10 +95,12 @@ MCP **Streamable HTTP**, JSON-RPC 2.0 over `POST /mcp`:
 | `GET /mcp` | `405` (no SSE stream). `DELETE /mcp` → `204`. |
 | `GET /health` | `{ ok, session, binary, pid, calls, busy }` — needs the key. |
 
-Tool results are `content: [{ type: "text", text: <JSON> }]`; failures are `isError: true` with a
-one-line message (`No function at 0x401000`, `Hex-Rays decompiler is not available in this IDA`,
-`Couldn't parse the pattern`, …). Every tool carries MCP annotations: `readOnlyHint`,
-`destructiveHint`, `title`.
+Tool results are `content: [{ type: "text", text: <JSON> }]` (and the same object as
+`structuredContent`); failures are `isError: true` with a one-line message (`No function at
+0x401000`, `Hex-Rays decompiler is not available in this IDA`, `Couldn't parse the pattern`, …).
+Every tool carries MCP annotations: `readOnlyHint`, `destructiveHint`, `title`. Schemas are strict
+(`additionalProperties: false`); an argument a model invents (`"action": "search_names"` is a
+favourite) is dropped, the call still runs, and the result lists it under `ignored_arguments`.
 
 ## Execution model
 
@@ -105,13 +109,22 @@ one-line message (`No function at 0x401000`, `Hex-Rays decompiler is not availab
   runs IDA calls concurrently with you or with another tool.
 - One tool runs at a time (a lock); parallel requests queue. `/health` reports `busy` with the name
   of the running tool.
+- **Chunked tools** (`search_text`, `search_bytes`, `decompile_many`, `find_similar_functions`) run on
+  the server thread and send *windows* of work to the main thread (3000 items, 4 MB, one function,
+  300 functions), so IDA's UI breathes between windows and you can keep working. They take
+  `budget_ms` (default 20 s; 60 s for `decompile_many`): when it runs out they return what they
+  have with `truncated: true` and `resume_from` / `remaining` so the next call continues.
 - Lists are **paged** (`offset`, `limit`, `total`, `next_offset`). `list_strings` caches the string
-  list for 5 minutes (`refresh=true` rebuilds it). `search_text` stops after `limit` hits or 20 s.
+  list for 5 minutes (`refresh=true` rebuilds it).
 - Addresses accept an int, hex (`0x401000` / `401000h`), or a name (mangled or demangled).
 
 ## Tools
 
-Read-only (21) — Kiln runs these without asking, except in Manual mode:
+59 tools. Read-only ones Kiln runs without asking (except in Manual mode); modifying ones ask before
+each call (except in Bypass mode) and Plan mode never offers them; ⚠ = `destructiveHint`, which the
+approval card says.
+
+### Understanding the code (read-only)
 
 | Tool | Arguments | What it returns |
 |---|---|---|
@@ -119,25 +132,36 @@ Read-only (21) — Kiln runs these without asking, except in Manual mode:
 | `list_segments` | — | name, class, start, end, size, permissions, bitness |
 | `list_functions` | `filter?`, `regex?`, `offset?`, `limit?` | address, name, size — paged |
 | `get_function` | `address` | bounds, size, name, prototype, comments, chunks, callers count, frame size, library / thunk / no-return |
+| `get_functions` | `addresses[]` | the same for up to 50 functions in one call (`error` per bad address) |
+| `get_callers` | `address`, paging | who calls it: one row per calling function with call count and sites |
+| `get_callees` | `address`, paging | what it calls: one row per target with kind (function / import / thunk / data), call count, sites |
 | `decompile` | `address` | Hex-Rays pseudocode of the function |
+| `decompile_many` | `addresses[]`, `max_chars_each?`, `budget_ms?` | pseudocode of up to 20 functions; `remaining` when the budget ran out |
+| `get_pseudocode_lines` | `address` | pseudocode as numbered lines, each with the address it came from |
 | `disassemble` | `address`, `count?`, `max_lines?` | the whole function, or `count` instructions from an address |
-| `get_xrefs_to` | `address`, `offset?`, `limit?` | who calls / jumps to / reads / writes it |
-| `get_xrefs_from` | `address`, `whole_function?`, `offset?`, `limit?` | what it calls, jumps to, reads, writes |
-| `list_imports` | `filter?`, `offset?`, `limit?` | module, name, address, ordinal |
-| `list_exports` | `offset?`, `limit?` | name, address, ordinal |
-| `list_strings` | `filter?`, `min_length?`, `refresh?`, `offset?`, `limit?` | address, length, type, text |
-| `search_names` | `query`, `regex?`, `offset?`, `limit?` | names containing text / matching a regex, with demangled form |
+| `get_xrefs_to` | `address`, paging | who calls / jumps to / reads / writes it |
+| `get_xrefs_from` | `address`, `whole_function?`, paging | what it calls, jumps to, reads, writes |
+| `list_imports` | `filter?`, paging | module, name, address, ordinal |
+| `list_exports` | paging | name, address, ordinal |
+| `list_strings` | `filter?`, `min_length?`, `refresh?`, paging | address, length, type, text |
+| `search_names` | `query`, `regex?`, paging | names containing text / matching a regex, with demangled form |
+| `search_text` | `text`, `case_sensitive?`, `start?`, `end?`, `limit?`, `budget_ms?` | disassembly lines (and comments) containing text; `resume_from` |
+| `search_bytes` | `pattern`, `start?`, `end?`, `limit?`, `budget_ms?` | addresses of a hex pattern (`??` wildcards) and their functions; `resume_from` |
+| `find_similar_functions` | `address`, `limit?`, `min_similarity?`, `budget_ms?` | functions with the same instruction shapes (inlined / duplicated / templated copies), scored 0..1 |
+| `suggest_struct_from_accesses` | `address`, `register?`, `name?` | a draft C struct from the `[reg+off]` accesses in a function, with the access list |
 | `read_bytes` | `address`, `size?`, `debugger?` | hex + printable ASCII, up to 64 KB, from the database or the live process |
-| `search_bytes` | `pattern`, `start?`, `end?`, `limit?` | addresses of a hex pattern (`??` wildcards) and their functions |
-| `search_text` | `text`, `case_sensitive?`, `start?`, `limit?` | disassembly lines containing text |
-| `list_types` | `filter?`, `offset?`, `limit?` | local types: ordinal, name, kind, size |
+| `get_data_item` | `address`, `max_elements?` | a data item decoded: string, number / array, pointer (and target), struct instance (member values), or code |
+| `list_types` | `filter?`, paging | local types: ordinal, name, kind, size |
 | `get_type` | `name?`, `ordinal?` | a type's full C definition |
 | `get_stack_frame` | `address` | a function's frame: variables / arguments with offset, size, type |
+| `list_signatures` | — | FLIRT signatures applied: name, library, matches |
+| `list_bookmarks` | — | IDA bookmarks: slot, address, name, description, function |
+| `list_breakpoints` | — | address, enabled, type, size, condition, pass count |
 | `get_cursor` | — | the address under the user's cursor and its function |
-| `get_debugger_state` | — | debugging?, state, threads, current registers |
+| `get_debugger_state` | — | debugging?, state, threads, registers; when suspended: `ip`, the instruction, the function |
 | `jump_to` | `address` | moves IDA's view (changes nothing) |
 
-Modifying (12) — Kiln asks you before each one (except in Bypass mode); Plan mode never offers them:
+### Changing the database (modifying)
 
 | Tool | Arguments | Effect |
 |---|---|---|
@@ -145,16 +169,37 @@ Modifying (12) — Kiln asks you before each one (except in Bypass mode); Plan m
 | `set_comment` | `address`, `comment`, `repeatable?` | instruction / data comment |
 | `set_function_comment` | `address`, `comment`, `repeatable?` | the comment at the top of a function |
 | `set_type` | `address`, `declaration` | apply a prototype or a variable type |
+| `set_calling_convention` | `address`, `convention` | cdecl / stdcall / fastcall / thiscall / pascal / usercall / userpurge, keeping the rest of the prototype |
+| `mark_as_noreturn` | `address`, `noreturn?` | mark a function as never returning (callers re-analysed), or clear it |
 | `declare_types` | `declarations` | add / replace structs, unions, enums, typedefs |
 | `rename_local_variable` | `function`, `old_name`, `new_name` | rename a pseudocode local (Hex-Rays) |
+| `set_lvar_type` | `function`, `name`, `type` | type a pseudocode local / argument (Hex-Rays) |
+| `set_lvar_comment` | `function`, `name`, `comment` | comment on a pseudocode local (Hex-Rays) |
 | `create_function` | `address` | like pressing **P** |
 | `undefine` ⚠ | `address`, `size?` | like pressing **U** — destructive |
 | `patch_bytes` ⚠ | `address`, `hex` | patch the database (IDA keeps the originals for *Apply patches*) — destructive |
+| `apply_signature` | `name` | queue a FLIRT signature (then `wait_for_analysis`, `list_signatures`) |
+| `add_bookmark` | `address`, `description` | an IDA bookmark (Ctrl-M) — a trail the user can walk |
+| `delete_bookmark` | `slot` | remove one (higher slots move down, as IDA does) |
 | `wait_for_analysis` | — | block until auto-analysis finishes |
 | `save_database` | — | save the IDB |
 | `run_python` ⚠ | `code` | run IDAPython in IDA and return stdout / the result — anything the API can do |
 
-⚠ = `destructiveHint`; Kiln's approval card says so.
+### Driving the debugger (modifying)
+
+The debugger selected in IDA is used (win32 is loaded on Windows if none is). IDA may show its own
+confirmation the first time a process is started; the call waits for it.
+
+| Tool | Arguments | Effect |
+|---|---|---|
+| `set_breakpoint` | `address`, `kind?` (software / exec / write / read / access), `size?`, `condition?`, `enabled?` | add or update a breakpoint |
+| `delete_breakpoint` | `address` | remove it |
+| `debugger_start` ⚠ | `path?`, `args?`, `directory?`, `break_at?`, `timeout_s?` | **runs the program** under IDA and waits until it is suspended (at `break_at`, a breakpoint, or the entry); returns the stop event, instruction, registers |
+| `debugger_attach` ⚠ | `pid`, `timeout_s?` | attach to a running process and suspend it |
+| `debugger_step` | `action` (step_over / step_into / step_out / continue / run_to), `address?`, `timeout_s?` | drive the process and wait for the next stop; `event: timeout` means it is still running |
+| `set_register` | `name`, `value` | set a register of the suspended process |
+| `write_memory` ⚠ | `address`, `hex` | write the live process's memory (the database is untouched) |
+| `debugger_stop` ⚠ | `detach?` | kill the process (or detach) and end the session |
 
 ## Testing
 
@@ -166,10 +211,12 @@ set PYTHONIOENCODING=utf-8
 python tests/live_test.py
 ```
 
-It reads the newest session file and runs 50 checks: security (401 / 403 / 405), `/health`,
+It reads the newest session file and runs 78 checks: security (401 / 403 / 405), `/health`,
 `initialize`, notifications → 202, `tools/list`, every read-only tool, each modifying tool followed
-by its undo, and 6 concurrent calls. Last run against IDA 9.1 + Hex-Rays on `whoami.exe`:
-**50 passed, 0 failed**.
+by its undo, the searches with limits and budgets, unknown-argument handling, bookmarks, breakpoints,
+a real debugger run (start at the target, step, set a register, write memory back, continue, stop —
+set `KILN_LIVE_DEBUGGER=0` to skip it) and 6 concurrent calls. Last run against IDA 9.1 + Hex-Rays
+on `whoami.exe`: **78 passed, 0 failed**.
 
 ## Troubleshooting
 
@@ -180,14 +227,19 @@ by its undo, and 6 concurrent calls. Last run against IDA 9.1 + Hex-Rays on `who
 | `/ida` shows **gone** | That IDA process has exited; the chat keeps the attachment and reconnects when the same database is opened again. |
 | Port in use | The plugin scans 24137…24236. To start elsewhere set `"port"` in `%APPDATA%\Kiln\ida\plugin.json`. |
 | `Hex-Rays decompiler is not available` | No decompiler licence for this processor; `disassemble` still works. |
-| A call takes long and IDA's UI freezes | Big `list_strings` / `search_text` on a large database run on IDA's main thread — that is required by the IDA API. They are bounded (cache, 20 s limit) but not interruptible. |
+| A call takes long and IDA's UI freezes | A single IDA call (one `decompile`, building `list_strings`) runs on IDA's main thread — the IDA API requires it. The searches, batch decompiles and similarity scans are chunked with a `budget_ms`, so the UI breathes between windows. |
+| `debugger_start` fails or hangs | Pick a debugger in IDA (Debugger → Select debugger) and check Debugger → Process options; the input file must exist. A confirmation dialog in IDA blocks the call until answered. |
 | `401` from a script | Send `Authorization: Bearer <token>` from the session file — every endpoint needs it. |
 | Headless `idat -S` | Cross-thread `execute_sync` is only serviced by the GUI event loop; the server needs the IDA GUI (`ida.exe`). |
 
 ## Limitations
 
 - IDA 9.x API only (no 7.x / 8.x compatibility layer).
-- No plugin-side per-call timeout: a tool runs to completion on the main thread. Kiln times a call
-  out after 10 minutes on its side.
+- A non-chunked tool runs to completion on the main thread (no per-call timeout there). Kiln times a
+  call out after 10 minutes on its side; the chunked tools honour `budget_ms`.
+- `suggest_struct_from_accesses` reads operands as text (`[rcx+18h]`), which is right for x86 / x64
+  and ARM-style `[x0,#0x18]` is not handled yet.
+- `find_similar_functions` compares instruction shapes, not semantics: it finds copies and near
+  copies, not reimplementations.
 - `read_bytes` with `debugger=true` needs a suspended debuggee.
 - One session per IDA instance — one database at a time, as in IDA itself.
