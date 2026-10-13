@@ -287,14 +287,22 @@ def main():
         check(ds and ds["state"] == "suspended" and ds.get("ip") and ds["event"] in ("breakpoint", "process_started", "step"), f"debugger_start stops at the target: {err or (ds['event'] + ' at ' + str(ds.get('ip')))}")
         if ds and ds["state"] == "suspended":
             ip0 = ds["ip"]
+            # At the function's first instruction its arguments are still where the ABI puts them.
+            ga, err = c.call("get_arguments")
+            check(ga is not None and ga.get("arguments"), f"get_arguments at the entry: {err or json.dumps(ga.get('arguments'))[:170]}")
+            if ga and ga.get("arguments"):
+                check(all("value" in a or "error" in a for a in ga["arguments"]), "each argument has a value read from the process")
             # The debugger events the plugin pushed (what Kiln's watch long-polls): the stop is there with its state.
             ev, err = c.call("wait_for_debugger_event", since=0, timeout_s=2)
             stops = [e for e in (ev or {}).get("events", []) if e["event"] in ("process_started", "breakpoint")]
             check(ev is not None and ev.get("seq", 0) >= 1 and stops, f"wait_for_debugger_event returned the stops: {[e['event'] for e in (ev or {}).get('events', [])]}")
             bpe = next((e for e in stops if e["event"] == "breakpoint"), None)
             check(bpe is None or (bpe.get("ip") and "registers" in bpe and bpe.get("source") == "debugger_start"), f"the breakpoint event carries ip/registers and its source: {err or (bpe and bpe.get('source'))}")
+            check(bpe is None or "arguments" in bpe or "arguments_note" in bpe, "and the function's arguments (or why they could not be read)")
             so, err = c.call("debugger_step", action="step_over", timeout_s=20)
             check(so and so["state"] == "suspended" and so["ip"] != ip0, f"debugger_step step_over moved from {ip0} to {so and so.get('ip')}: {err or 'ok'}")
+            ga2, _ = c.call("get_arguments")
+            check(ga2 is not None and not ga2.get("arguments"), f"past the entry it says why it can't read them instead of guessing: {str(ga2 and ga2.get('arguments_note'))[:90]}")
             regs = so["registers"] if so else {}
             reg = "rax" if "rax" in regs else ("eax" if "eax" in regs else None)
             if reg:

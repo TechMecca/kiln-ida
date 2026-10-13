@@ -31,7 +31,7 @@ Any MCP client that speaks Streamable HTTP can use it; the session file (below) 
    the Output window shows:
 
    ```
-   [Kiln IDA] server ON — session 50a47088 at http://127.0.0.1:24137/mcp (60 tools, Hex-Rays yes)
+   [Kiln IDA] server ON — session 50a47088 at http://127.0.0.1:24137/mcp (61 tools, Hex-Rays yes)
    ```
 
 3. In Kiln, type `/ida` in any chat, tick the session, Done. The chip above the composer shows
@@ -59,13 +59,13 @@ While the server is on, the plugin keeps `%APPDATA%\Kiln\ida\sessions\<id>.json`
 
 ```json
 {
-  "id": "50a47088", "plugin": "kiln-ida", "version": "0.3.1",
+  "id": "50a47088", "plugin": "kiln-ida", "version": "0.4.0",
   "name": "whoami.exe", "binary": "whoami.exe",
   "input_path": "C:\\dumps\\whoami.exe", "idb_path": "C:\\dumps\\whoami.exe.i64",
   "pid": 10216, "host": "127.0.0.1", "port": 24137, "url": "http://127.0.0.1:24137/mcp",
   "token": "…secret…", "ida_version": "9.1", "sdk": 910, "python": "3.10.5",
   "hexrays": true, "processor": "metapc", "bits": 64, "gui": true,
-  "started_at": "2026-10-13T10:00:00Z", "tools": 60
+  "started_at": "2026-10-13T10:00:00Z", "tools": 61
 }
 ```
 
@@ -119,6 +119,17 @@ favourite) is dropped, the call still runs, and the result lists it under `ignor
   list for 5 minutes (`refresh=true` rebuilds it).
 - Addresses accept an int, hex (`0x401000` / `401000h`), or a name (mangled or demangled).
 
+## Breakpoints are hardware only
+
+`set_breakpoint` uses the CPU's debug registers (`kind=exec` by default, or `write` / `read` / `access` to watch
+data). Not one byte of the program is modified, so code that checksums itself sees nothing. Software `0xCC`
+breakpoints are deliberately **not** offered: they patch the instruction and any self-check can spot them. The
+trade-off is that x86 has only four debug registers, so delete breakpoints you have finished with.
+
+A breakpoint stops the whole process when it is hit — every thread. To watch a hot function without freezing the
+target, give the breakpoint an IDC `condition` that does its logging and then evaluates false: IDA resumes on its
+own. Note that such a breakpoint produces no stop, so nothing appears in the live card or the review.
+
 ## Watching the debugger
 
 While the server is on the plugin hooks IDA's debugger. Every stop — a breakpoint, an exception, a pause,
@@ -128,6 +139,12 @@ stack, the breakpoint that fired) and queued with a sequence number. `wait_for_d
 `timeout_s` with an empty list. It runs off IDA's main thread, so stepping and reading still work while a
 client waits.
 
+A stop inside a function also carries that function's **arguments**, read out of the live process: each one's name
+and type from the prototype, its value, `text` for a `char *` / `wchar_t *` (the string itself), and `points_to` for
+a pointer into something named. They are only read at the function's first instruction, where a breakpoint on the
+function's address stops — once the prologue has run the incoming values are no longer where the ABI says, so the
+event says so rather than guessing. A function with no prototype falls back to the raw stack slots a caller pushed.
+
 Each event carries a `source`: the Kiln tool that was running when it happened (`debugger_start`,
 `debugger_step`, …), or `null` when nothing was — i.e. the user drove IDA, or a running process stopped on
 its own. A client watches by looping `wait_for_debugger_event` and reviewing the `null`-source stops (the
@@ -136,7 +153,7 @@ posts each stop and the model looks at what is going on, then drives on with `de
 
 ## Tools
 
-60 tools. Read-only ones Kiln runs without asking (except in Manual mode); modifying ones ask before
+61 tools. Read-only ones Kiln runs without asking (except in Manual mode); modifying ones ask before
 each call (except in Bypass mode) and Plan mode never offers them; ⚠ = `destructiveHint`, which the
 approval card says.
 
@@ -175,7 +192,8 @@ approval card says.
 | `list_breakpoints` | — | address, enabled, type, size, condition, pass count |
 | `get_cursor` | — | the address under the user's cursor and its function |
 | `get_debugger_state` | — | debugging?, state, threads, registers; when suspended: `ip`, the instruction, the function |
-| `wait_for_debugger_event` | `since?`, `timeout_s?` | long-poll: the debugger stops after `since` (instruction, registers, stack, breakpoint, `source`) |
+| `get_arguments` | `address?` | the stopped function's arguments read out of the live process: name, type and value, strings followed, pointers named |
+| `wait_for_debugger_event` | `since?`, `timeout_s?` | long-poll: the debugger stops after `since` (instruction, registers, stack, breakpoint, `source`). Kiln uses it for the live debugger card and for reviewing stops |
 | `jump_to` | `address` | moves IDA's view (changes nothing) |
 
 ### Changing the database (modifying)
@@ -209,7 +227,7 @@ confirmation the first time a process is started; the call waits for it.
 
 | Tool | Arguments | Effect |
 |---|---|---|
-| `set_breakpoint` | `address`, `kind?` (software / exec / write / read / access), `size?`, `condition?`, `enabled?` | add or update a breakpoint |
+| `set_breakpoint` | `address`, `kind?` (exec / write / read / access), `size?`, `condition?`, `enabled?` | add or update a **hardware** breakpoint — debug registers, no byte of the program is changed, so self-checks see nothing. Software (`0xCC`) breakpoints are deliberately not offered. Only 4 debug registers exist. A condition that evaluates false logs without stopping the process |
 | `delete_breakpoint` | `address` | remove it |
 | `debugger_start` ⚠ | `path?`, `args?`, `directory?`, `break_at?`, `timeout_s?` | **runs the program** under IDA and waits until it is suspended (at `break_at`, a breakpoint, or the entry); returns the stop event, instruction, registers |
 | `debugger_attach` ⚠ | `pid`, `timeout_s?` | attach to a running process and suspend it |

@@ -65,7 +65,7 @@ try:
 except ImportError:  # no decompiler in this installation
     ida_hexrays = None
 
-PLUGIN_VERSION = "0.3.1"
+PLUGIN_VERSION = "0.4.0"
 PLUGIN_NAME = "Kiln IDA"
 DEFAULT_PORT = 24137
 PORT_RANGE = 100
@@ -723,6 +723,24 @@ def _reg_names() -> list:
             return ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "efl", "cs", "ds", "es", "fs", "gs", "ss"]
         return ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "efl", "cs", "ds", "es", "fs", "gs", "ss"]
     return list(ida_idp.ph_get_regnames())[:64]
+
+
+@tool("get_arguments", "The arguments of the function the debugged process is stopped in, read out of the live process: each argument's name, type and value, with strings followed and pointers named. Accurate at the function's first instruction (before its prologue runs), which is exactly where a breakpoint on the function's address stops.", {"address": {**ADDR, "description": "Which function (default: where the process is stopped)."}})
+def t_get_args(args):
+    if not ida_dbg.is_debugger_on():
+        raise ToolError("The debugger isn't running.")
+    if ida_dbg.get_process_state() != ida_dbg.DSTATE_SUSP:
+        raise ToolError("The process is running — it has to be stopped to read its arguments.")
+    ip = int(ida_dbg.get_ip_val() or BADADDR)
+    ea = parse_ea(args["address"]) if args.get("address") else ip
+    pfn = func_of(ea)
+    if not pfn:
+        raise ToolError("%s is not inside a function." % hexa(ea))
+    out = {"function": func_summary(pfn), "ip": hexa(ip) if ip != BADADDR else None}
+    out.update(_read_args(pfn, ip))
+    if "arguments" not in out and "arguments_note" not in out:
+        out["arguments_note"] = "no arguments could be read here"
+    return out
 
 
 @tool("get_debugger_state", "The debugger: whether a process is being debugged, its state, threads, and the current thread's registers.")
@@ -1680,7 +1698,8 @@ def t_dbg_stop(args):
 
 
 def _bpt_row(b) -> dict:
-    return {"address": hexa(b.ea), "enabled": b.enabled(), "type": {ida_idd.BPT_SOFT: "software", ida_idd.BPT_EXEC: "hardware exec", ida_idd.BPT_WRITE: "hardware write", ida_idd.BPT_READ: "hardware read", ida_idd.BPT_RDWR: "hardware read/write"}.get(b.type, str(b.type)), "size": b.size, "condition": b.condition or "", "pass_count": b.pass_count, "name": name_at(b.ea)}
+    kinds = {ida_idd.BPT_SOFT: "software", ida_idd.BPT_EXEC: "hardware exec", ida_idd.BPT_WRITE: "hardware write", ida_idd.BPT_READ: "hardware read", ida_idd.BPT_RDWR: "hardware read/write"}
+    return {"address": hexa(b.ea), "enabled": b.enabled(), "type": kinds.get(b.type, str(b.type)), "size": b.size, "condition": b.condition or "", "pass_count": b.pass_count, "name": name_at(b.ea)}
 
 
 @tool("list_breakpoints", "The debugger's breakpoints: address, enabled, type, size, condition, pass count.")
@@ -1693,18 +1712,19 @@ def t_list_bpts(args):
     return {"count": len(out), "breakpoints": out}
 
 
-@tool("set_breakpoint", "Add (or update) a breakpoint at an address: software by default, or a hardware read / write / access breakpoint on data with kind=write|read|access and size. Optional IDC condition (e.g. \"rcx == 5\"), enabled flag.", {"address": ADDR, "kind": {"type": "string", "enum": ["software", "exec", "write", "read", "access"]}, "size": {"type": "integer", "description": "Bytes watched by a hardware breakpoint (1, 2, 4, 8)."}, "condition": {"type": "string"}, "enabled": {"type": "boolean"}}, ["address"], write=True)
+@tool("set_breakpoint", "Add (or update) a HARDWARE breakpoint — the CPU's debug registers, so not one byte of the program changes and code that checksums itself sees nothing. kind=exec (default) breaks when the address is executed; kind=write|read|access watches DATA at the address (give size). There are only 4 debug registers, so delete breakpoints you no longer need. An IDC condition that evaluates to false lets the process carry straight on (log without freezing it). Software (0xCC) breakpoints are deliberately not available: they patch the code and any self-check can see them.", {"address": ADDR, "kind": {"type": "string", "enum": ["exec", "write", "read", "access"], "description": "Default exec (break when it runs)."}, "size": {"type": "integer", "description": "Bytes watched by a data breakpoint (1, 2, 4, 8)."}, "condition": {"type": "string"}, "enabled": {"type": "boolean"}}, ["address"], write=True)
 def t_set_bpt(args):
     ea = parse_ea(args.get("address"))
-    kind = str(args.get("kind") or "software")
-    btype = {"software": ida_idd.BPT_SOFT, "exec": ida_idd.BPT_EXEC, "write": ida_idd.BPT_WRITE, "read": ida_idd.BPT_READ, "access": ida_idd.BPT_RDWR}.get(kind)
+    # Hardware only: a software breakpoint writes 0xCC into the code, which a self-checking target can detect.
+    kind = str(args.get("kind") or "exec")
+    btype = {"exec": ida_idd.BPT_EXEC, "write": ida_idd.BPT_WRITE, "read": ida_idd.BPT_READ, "access": ida_idd.BPT_RDWR}.get(kind)
     if btype is None:
-        raise ToolError("kind must be software, exec, write, read or access.")
-    size = int_arg(args, "size", 0 if btype == ida_idd.BPT_SOFT else 1, 0, 8)
+        raise ToolError("kind must be exec, write, read or access (hardware only — software breakpoints patch the code and are not offered).")
+    size = int_arg(args, "size", 1, 1, 8)
     existing = ida_dbg.bpt_t()
     if not ida_dbg.get_bpt(ea, existing):
         if not ida_dbg.add_bpt(ea, size, btype):
-            raise ToolError(f"IDA couldn't add a breakpoint at {hexa(ea)} (hardware breakpoints need a running process and a free debug register).")
+            raise ToolError(f"IDA couldn't add a hardware {kind} breakpoint at {hexa(ea)}: they need a running process and a free debug register, and x86 has only 4. Delete one (list_breakpoints / delete_breakpoint) and try again.")
     b = ida_dbg.bpt_t()
     ida_dbg.get_bpt(ea, b)
     changed = False
@@ -1758,6 +1778,142 @@ def t_write_mem(args):
         raise ToolError(f"Couldn't write {len(data)} bytes at {hexa(ea)} in the process.")
     back = ida_idd.dbg_read_memory(ea, len(data)) or b""
     return {"address": hexa(ea), "size": len(data), "now": back.hex(" ")}
+
+
+# ───────────────────────── reading a function's arguments at a stop ─────────────────────────
+
+STR_PTR_TYPES = ("char *", "char*", "CHAR *", "LPSTR", "LPCSTR", "PCSTR", "PSTR")
+WSTR_PTR_TYPES = ("wchar_t *", "wchar_t*", "WCHAR *", "LPWSTR", "LPCWSTR", "PCWSTR", "PWSTR", "OLECHAR *", "BSTR")
+
+
+def _dbg_bytes(ea: int, size: int) -> bytes:
+    try:
+        return ida_idd.dbg_read_memory(ea, size) or b""
+    except Exception:
+        return b""
+
+
+def _dbg_int(ea: int, size: int) -> "int | None":
+    b = _dbg_bytes(ea, size)
+    return int.from_bytes(b, "little") if len(b) == size else None
+
+
+def _dbg_cstring(ea: int, wide: bool = False, limit: int = 300) -> "str | None":
+    """Read a NUL-terminated string out of the debugged process (not the database: the process may have changed it)."""
+    if not ea:
+        return None
+    step, raw = 2 if wide else 1, b""
+    term = b"\x00\x00" if wide else b"\x00"
+    while len(raw) < limit * step:
+        chunk = _dbg_bytes(ea + len(raw), 64)
+        if not chunk:
+            break
+        raw += chunk
+        end = raw.find(term)
+        if end >= 0:
+            if wide:
+                end += end % 2  # the match starts on the previous character's zero high byte
+            raw = raw[:end]
+            break
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-16-le" if wide else "utf-8", errors="replace")
+    except Exception:
+        return raw.decode("latin-1", errors="replace")
+
+
+def _reg(name: str) -> "int | None":
+    try:
+        v = ida_dbg.get_reg_val(name)
+        return int(v) if isinstance(v, (int, float)) else None
+    except Exception:
+        return None
+
+
+def _func_prototype(pfn):
+    """The function's argument list (name + type), from its prototype or IDA's guess. [] when unknown."""
+    tif = ida_typeinf.tinfo_t()
+    if not ida_nalt.get_tinfo(tif, pfn.start_ea):
+        try:
+            if ida_typeinf.guess_tinfo(tif, pfn.start_ea) != ida_typeinf.GUESS_FUNC_OK:
+                return None, []
+        except Exception:
+            return None, []
+    fi = ida_typeinf.func_type_data_t()
+    if not tif.get_func_details(fi):
+        return None, []
+    return fi, [(a.name or ("arg%d" % i), str(a.type)) for i, a in enumerate(fi)]
+
+
+def _arg_slots(cc, count: int, bits: int) -> list:
+    """Where each argument sits at the function's FIRST instruction (none of the prologue has run yet)."""
+    slots = []
+    if bits == 64:
+        # Windows x64: the first four integer arguments are in registers, the rest above the shadow space.
+        regs = ["rcx", "rdx", "r8", "r9"]
+        for i in range(count):
+            slots.append(("reg", regs[i]) if i < 4 else ("stack", 8 * (i + 1)))
+        return slots
+    masked = (cc & ida_typeinf.CM_CC_MASK) if isinstance(cc, int) else None
+    lead = []
+    if masked == ida_typeinf.CM_CC_THISCALL:
+        lead = ["ecx"]
+    elif masked == ida_typeinf.CM_CC_FASTCALL:
+        lead = ["ecx", "edx"]
+    for i in range(count):
+        slots.append(("reg", lead[i]) if i < len(lead) else ("stack", 4 * (i - len(lead) + 1)))
+    return slots
+
+
+def _format_arg(name: str, type_str: str, value, size: int) -> dict:
+    out = {"name": name, "type": type_str}
+    if value is None:
+        out["error"] = "couldn't read it"
+        return out
+    out["value"] = hexa(value)
+    t = type_str.replace("const ", "").strip()
+    one_level = t.count("*") <= 1  # char ** is an array of pointers, not a string
+    if one_level and any(t.startswith(x) or t == x for x in WSTR_PTR_TYPES):
+        out["text"] = _dbg_cstring(value, wide=True)
+    elif one_level and any(t.startswith(x) or t == x for x in STR_PTR_TYPES):
+        out["text"] = _dbg_cstring(value)
+    elif t.endswith("*"):
+        nm = name_at(value)
+        if nm:
+            out["points_to"] = nm
+    else:
+        out["int"] = value - (1 << (size * 8)) if value >= (1 << (size * 8 - 1)) else value
+    return out
+
+
+def _read_args(pfn, ip: int) -> dict:
+    """The function's arguments, read from the suspended process. Only trustworthy at its first instruction."""
+    if pfn is None or ida_dbg.get_process_state() != ida_dbg.DSTATE_SUSP:
+        return {}
+    bits = 64 if ida_ida.inf_is_64bit() else 32
+    at_entry = ip == pfn.start_ea
+    fi, args = _func_prototype(pfn)
+    size = bits // 8
+    sp = _reg("rsp" if bits == 64 else "esp")
+    if not args:
+        if not at_entry or sp is None:
+            return {}
+        # No prototype: show the raw slots a caller would have pushed, so there is still something to go on.
+        raw = []
+        for i in range(6):
+            v = _dbg_int(sp + size * (i + 1), size)
+            raw.append({"name": "arg%d" % i, "type": "?", **({"value": hexa(v)} if v is not None else {"error": "couldn't read it"})})
+        return {"arguments": raw, "arguments_note": "no prototype for this function — these are the raw stack slots at its entry"}
+    if not at_entry:
+        return {"arguments_note": "arguments are only read at the function's first instruction (%s); the prologue has already run here" % hexa(pfn.start_ea)}
+    if sp is None:
+        return {}
+    out = []
+    for (name, type_str), slot in zip(args, _arg_slots(getattr(fi, "cc", None), len(args), bits)):
+        value = _reg(slot[1]) if slot[0] == "reg" else _dbg_int(sp + slot[1], size)
+        out.append(_format_arg(name, type_str, value, size))
+    return {"arguments": out}
 
 
 # ───────────────────────── debugger events (pushed by IDA, long-polled by Kiln) ─────────────────────────
@@ -1821,6 +1977,10 @@ def _push_event(kind: str, ea: "int | None" = None, tid: "int | None" = None, ex
                         continue
                 ev["registers"] = regs
                 ev["stack"] = _stack_top()
+                try:
+                    ev.update(_read_args(func_of(ip) if ip != BADADDR else None, ip))
+                except Exception as e:
+                    ev["arguments_note"] = "couldn't read the arguments: %s: %s" % (type(e).__name__, e)
             if kind == "breakpoint" and ea is not None:
                 b = ida_dbg.bpt_t()
                 if ida_dbg.get_bpt(int(ea), b):
