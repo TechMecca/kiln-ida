@@ -346,6 +346,13 @@ def main():
         print("  (debugger run skipped: KILN_LIVE_DEBUGGER=0 or the input file isn't there)")
 
     # Concurrency: several requests at once are served (serialized inside IDA).
+    # A debugger run rebases the database to where Windows loaded the process (ASLR): find the function again.
+    for cand in ("main", "wmain", "WinMain", "start", first["name"]):
+        r, _ = c.call("search_names", query=cand)
+        hit = r and next((i for i in r["items"] if i["name"] == cand), None)
+        if hit:
+            target = hit["address"]
+            break
     import threading
     results = []
 

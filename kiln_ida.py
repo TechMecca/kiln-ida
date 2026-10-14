@@ -65,7 +65,7 @@ try:
 except ImportError:  # no decompiler in this installation
     ida_hexrays = None
 
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_VERSION = "0.5.1"
 PLUGIN_NAME = "Kiln IDA"
 DEFAULT_PORT = 24137
 PORT_RANGE = 100
@@ -106,7 +106,9 @@ def save_prefs(p: dict) -> None:
 
 def _atomic_write(path: str, text: str) -> None:
     tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    # 0600: the session file holds the server's key — other users on a shared Linux / macOS box can't read it.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
     os.replace(tmp, path)
 
@@ -219,8 +221,13 @@ def parse_ea(value, what: str = "address") -> int:
         s = str(value).strip()
         if not s:
             raise ToolError(f"Give the {what} (hex like 0x401000, or a name).")
-        if re.fullmatch(r"(0[xX])?[0-9a-fA-F]+[hH]?", s):
-            ea = int(s.rstrip("hH"), 16)
+        explicit_hex = re.fullmatch(r"0[xX][0-9a-fA-F]+|[0-9a-fA-F]+[hH]|[0-9]+", s)
+        bare_hex = re.fullmatch(r"[0-9a-fA-F]+", s)
+        named = ida_name.get_name_ea(BADADDR, s) if bare_hex and not explicit_hex else BADADDR
+        if named != BADADDR:
+            ea = named  # "add", "face", "beach": a function / label with that name wins over reading it as hex
+        elif explicit_hex or bare_hex:
+            ea = int(s[2:] if s[:2].lower() == "0x" else s.rstrip("hH"), 16)
         else:
             ea = ida_name.get_name_ea(BADADDR, s)
             if ea == BADADDR:
@@ -284,13 +291,15 @@ def hexrays_ok() -> bool:
     return bool(ida_hexrays) and bool(_state.hexrays)
 
 
-_strings_cache = {"at": 0.0, "minlen": 0, "items": None}
+_strings_cache = {"at": 0.0, "minlen": 0, "items": None, "base": None}
 
 
 def strings_list(min_length: int, refresh: bool) -> list:
     now = time.monotonic()
     c = _strings_cache
-    if refresh or c["items"] is None or c["minlen"] != min_length or now - c["at"] > 300:
+    # A debugger run rebases the database (ASLR): addresses cached before it are wrong after it.
+    base = ida_nalt.get_imagebase()
+    if refresh or c["items"] is None or c["minlen"] != min_length or c["base"] != base or now - c["at"] > 300:
         s = idautils.Strings(default_setup=False)
         s.setup(strtypes=[ida_nalt.STRTYPE_C, ida_nalt.STRTYPE_C_16], minlen=min_length, only_7bit=False, ignore_instructions=True)
         items = []
@@ -301,7 +310,7 @@ def strings_list(min_length: int, refresh: bool) -> list:
                 items.append({"address": hexa(it.ea), "length": it.length, "type": "utf16" if it.strtype == ida_nalt.STRTYPE_C_16 else "c", "text": str(it)})
             except Exception:
                 continue
-        c.update(at=now, minlen=min_length, items=items)
+        c.update(at=now, minlen=min_length, items=items, base=base)
     return c["items"]
 
 
@@ -918,7 +927,9 @@ def t_python(args):
     try:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             exec(compile(code, "<kiln_ida>", "exec"), env)
-    except Exception:
+    except SystemExit as e:  # the script called sys.exit(): it ended, IDA didn't
+        return {"ok": e.code in (None, 0), "output": buf.getvalue()[:60000], "exit_code": e.code if isinstance(e.code, int) else str(e.code)}
+    except BaseException:
         return {"ok": False, "output": buf.getvalue(), "error": traceback.format_exc(limit=3)}
     out = {"ok": True, "output": buf.getvalue()[:60000]}
     if "result" in env:
@@ -1585,8 +1596,15 @@ def _dbg_event_name(code: int) -> str:
             v = getattr(ida_idd, n, None)
             if isinstance(v, int):
                 DBG_EVENTS[v] = n.lower()
-    if code == -1:
+    # wait_for_next_event: DEC_TIMEOUT (0) = still running, DEC_ERROR (-1), DEC_NOTASK (-2) = no process.
+    if code is None:
+        return "none"
+    if code == 0:
         return "timeout"
+    if code == -1:
+        return "error"
+    if code == -2:
+        return "no_process"
     return DBG_EVENTS.get(code, str(code))
 
 
@@ -1689,7 +1707,7 @@ def t_dbg_stop(args):
         return {"debugger_on": False, "note": "nothing was being debugged"}
     detach = bool(args.get("detach"))
     ok = ida_dbg.detach_process() if detach else ida_dbg.exit_process()
-    code, deadline = -1, time.monotonic() + 15
+    code, deadline = None, time.monotonic() + 15
     while ida_dbg.is_debugger_on() and time.monotonic() < deadline:
         code = ida_dbg.wait_for_next_event(ida_dbg.WFNE_ANY, 2)
         if code in (getattr(ida_idd, "PROCESS_EXITED", -2), getattr(ida_idd, "PROCESS_DETACHED", -3)):
@@ -2054,6 +2072,11 @@ class _DbgHooks(ida_dbg.DBG_Hooks):
         _push_event("step")
         return 0
 
+    def dbg_run_to(self, *a):
+        # (pid, tid, ea): "run to cursor" finished — its temporary breakpoint isn't a user breakpoint, so dbg_bpt stays quiet.
+        _push_event("run_to", ea=a[2] if len(a) > 2 else None, tid=a[1] if len(a) > 1 else None)
+        return 0
+
 
 def _hook_debugger() -> None:
     if _state.dbg_hooks is None:
@@ -2317,6 +2340,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _json(self, code: int, obj, extra=None):
+        if code >= 400:
+            self.close_connection = True  # the request body (if any) wasn't read: never parse it as the next request
         self._send(code, json.dumps(obj).encode("utf-8"), extra=extra)
 
     def _authorized(self) -> bool:
@@ -2329,7 +2354,7 @@ class _Handler(BaseHTTPRequestHandler):
             return False
         auth = self.headers.get("Authorization") or ""
         got = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-        if not got or not secrets.compare_digest(got, _state.token):
+        if not got or not secrets.compare_digest(got.encode("utf-8", "replace"), str(_state.token).encode("utf-8")):
             self._json(401, {"error": "missing or wrong session key"})
             return False
         return True
@@ -2355,7 +2380,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         if not self._authorized():
             return
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0:
+            return self._json(400, {"error": "bad Content-Length"})
         if length > MAX_BODY:
             return self._json(413, {"error": "request too large"})
         raw = self.rfile.read(length) if length else b""
@@ -2402,7 +2432,7 @@ def register_session() -> None:
         "hexrays": _state.hexrays, "processor": ida_ida.inf_get_procname(), "bits": 64 if ida_ida.inf_is_64bit() else 32,
         "gui": bool(ida_kernwin.is_idaq()), "started_at": _state.started_at, "tools": len(TOOLS),
     }
-    os.makedirs(sessions_dir(), exist_ok=True)
+    os.makedirs(sessions_dir(), mode=0o700, exist_ok=True)
     _atomic_write(session_file(), json.dumps(info, indent=2))
     # Files left by IDA instances that are gone (crashed, killed) are cleaned up here.
     for fn in os.listdir(sessions_dir()):

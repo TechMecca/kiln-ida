@@ -59,7 +59,7 @@ While the server is on, the plugin keeps `%APPDATA%\Kiln\ida\sessions\<id>.json`
 
 ```json
 {
-  "id": "50a47088", "plugin": "kiln-ida", "version": "0.5.0",
+  "id": "50a47088", "plugin": "kiln-ida", "version": "0.5.1",
   "name": "whoami.exe", "binary": "whoami.exe",
   "input_path": "C:\\dumps\\whoami.exe", "idb_path": "C:\\dumps\\whoami.exe.i64",
   "pid": 10216, "host": "127.0.0.1", "port": 24137, "url": "http://127.0.0.1:24137/mcp",
